@@ -1,0 +1,72 @@
+{
+  "pos_catalog_items": [
+    {
+      "id": "pos_item_01_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "barcode": "4710001001",
+      "name": "精品冷萃美式咖啡 (大杯)",
+      "price": 100,
+      "stock_quantity": 100,
+      "is_active": 1,
+      "created_at": "2026-10-30 16:30:21"
+    },
+    {
+      "id": "pos_item_02_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "barcode": "4710001002",
+      "name": "手作黑糖肉桂捲",
+      "price": 90,
+      "stock_quantity": 50,
+      "is_active": 1,
+      "created_at": "2026-10-30 16:30:21"
+    },
+    {
+      "id": "pos_item_03_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "barcode": "4710001003",
+      "name": "衣索比亞莊園濾掛禮盒",
+      "price": 350,
+      "stock_quantity": 20,
+      "is_active": 1,
+      "created_at": "2026-10-30 16:30:21"
+    }
+  ],
+  "pos_registers": [
+    {
+      "id": "pos_reg_01_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "store_id": "pos_store_01_org_go_fixture",
+      "register_number": "REG-01",
+      "name": "1號收銀櫃檯",
+      "is_active": 1,
+      "created_at": "2026-10-30 16:30:21"
+    }
+  ],
+  "pos_shifts": [
+    {
+      "id": "pos_shift_01_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "store_id": "pos_store_01_org_go_fixture",
+      "register_id": "pos_reg_01_org_go_fixture",
+      "cashier_id": "usr_org_go_fixture_op",
+      "opening_cash": 1000,
+      "closing_cash": null,
+      "expected_cash": null,
+      "cash_discrepancy": null,
+      "status": "open",
+      "opened_at": "2026-10-30 16:30:21",
+      "closed_at": null,
+      "notes": null
+    }
+  ],
+  "pos_stores": [
+    {
+      "id": "pos_store_01_org_go_fixture",
+      "organization_id": "org_go_fixture",
+      "code": "STORE-XY",
+      "name": "示範門市 A（虛構）",
+      "address": "示範地址 A（非實際地址）",
+      "created_at": "2026-10-30 16:30:21"
+    }
+  ]
+}

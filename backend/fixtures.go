@@ -9,7 +9,7 @@ import (
 )
 
 func seedFixtures(tx *sql.Tx, org string) error {
-	b, e := migrations.ReadFile("migrations/fixtures.json")
+	b, e := migrations.ReadFile("migrations/pos_fixtures.json")
 	if e != nil {
 		return e
 	}
