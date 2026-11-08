@@ -125,11 +125,27 @@ func (a *App) stationAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if action == "print" && r.Method == "GET" {
-		if g.Scope != "back" {
+		if g.Scope != "back" && !(site == "pos" && r.URL.Query().Get("kind") == "pos-receipt") {
 			fail(w, 403, "Print center requires back-office access")
 			return
 		}
 		a.printData(w, r, id, site)
+		return
+	}
+	if action == "barcode" && site == "pos" {
+		a.posBarcode(w, r, id)
+		return
+	}
+	if action == "daily-report" && site == "pos" {
+		a.posDailyReport(w, r, id, g)
+		return
+	}
+	if action == "cart" && site == "pos" {
+		a.posCart(w, r, id, g)
+		return
+	}
+	if action == "business" && site == "pos" {
+		a.posBusiness(w, r, id, g)
 		return
 	}
 	fail(w, 501, "This operation has not been migrated to Go. No changes were made")
@@ -221,7 +237,13 @@ func (a *App) printData(w http.ResponseWriter, r *http.Request, id *Identity, si
 			table = d.Table
 		}
 	}
-	rows, e := queryMaps(a.db, "SELECT * FROM "+table+" WHERE organization_id=? AND id=?", id.OrganizationID, recordID)
+	query := "SELECT * FROM " + table + " WHERE organization_id=? AND id=?"
+	args := []any{id.OrganizationID, recordID}
+	if site == "pos" && kind.Dataset == "sales" && id.grant(site).Scope != "back" {
+		query += " AND cashier_id=?"
+		args = append(args, id.UserID)
+	}
+	rows, e := queryMaps(a.db, query, args...)
 	if e != nil || len(rows) != 1 {
 		fail(w, 404, "Document not found in this organization")
 		return
