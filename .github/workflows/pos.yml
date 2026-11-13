@@ -1,6 +1,7 @@
 name: POS validation and container publication
 on:
   push:
+    branches: [main]
   pull_request:
 permissions:
   contents: read

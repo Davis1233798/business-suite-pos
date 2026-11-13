@@ -7,3 +7,10 @@ The image workflow owns validation and publication. Private runtime
 provisioning and the public route are subsequent deployment steps.
 
 Validate the health revision in Go and in both native container builds.
+
+## Workflow boundaries
+
+Validate proposed changes on pull requests and publish revision-tagged
+images after a push to main. Feature branch pushes with an open pull
+request should consume one architecture matrix through the pull request
+event. Neither event activates a running OCI service.
