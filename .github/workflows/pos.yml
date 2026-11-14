@@ -19,6 +19,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Verify POS deployment, retry and rollback
+        run: python3 -B tests/test_pos_oci_deployment.py
       - uses: actions/setup-node@v4
         with:
           node-version: 24
@@ -77,3 +79,56 @@ jobs:
           printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
           docker tag pos-ci:${GITHUB_SHA} "$image:${GITHUB_SHA}${{ matrix.suffix }}"
           docker push "$image:${GITHUB_SHA}${{ matrix.suffix }}"
+
+  deploy-private-oci:
+    name: Deploy private POS runtime to OCI
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.POS_DEPLOY_ENABLED == 'true'
+    needs: [pos]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: pos-private-oci
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify this is still the latest main commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest=$(gh api "repos/${GITHUB_REPOSITORY}/commits/main" --jq .sha)
+          if [ "$latest" != "$GITHUB_SHA" ]; then
+            echo "A newer main commit exists; skipping this deployment."
+            exit 1
+          fi
+      - name: Resolve immutable ARM64 registry digest
+        id: image
+        run: |
+          set -euo pipefail
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/business-suite-pos-station"
+          digest=$(docker buildx imagetools inspect "$image:${GITHUB_SHA}-arm64" | awk '$1 == "Digest:" { print $2; exit }')
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+      - name: Configure POS-only SSH identity
+        env:
+          DEPLOY_KEY: ${{ secrets.OCI_POS_DEPLOY_KEY }}
+          HOST_KEY: ${{ secrets.OCI_POS_HOST_KEY }}
+        run: |
+          set -euo pipefail
+          test -n "$DEPLOY_KEY" && test -n "$HOST_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/pos_deploy
+          chmod 600 ~/.ssh/pos_deploy
+          printf '%s\n' "$HOST_KEY" > ~/.ssh/known_hosts
+      - name: Deploy by exact image digest
+        env:
+          POS_HOST: ${{ secrets.OCI_POS_HOST }}
+          IMAGE_DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          test -n "$POS_HOST"
+          [[ "$POS_HOST" =~ ^pos@[A-Za-z0-9.-]+$ ]]
+          ssh -i ~/.ssh/pos_deploy -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            -o BatchMode=yes -o ConnectTimeout=15 "$POS_HOST" "deploy $GITHUB_SHA $IMAGE_DIGEST"

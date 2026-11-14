@@ -1,0 +1,26 @@
+services:
+  station:
+    image: ${POS_IMAGE:?set POS_IMAGE to an immutable registry digest}
+    pull_policy: never
+    restart: unless-stopped
+    init: true
+    # Rootless Docker maps container root to the unprivileged host pos UID,
+    # which owns the isolated bind-mounted SQLite directory.
+    user: "0:0"
+    environment:
+      SUITE_RELEASE_SHA: ${POS_REVISION:?set POS_REVISION}
+      SUITE_WEB: /srv/station/web-dist
+      SUITE_DB: /srv/station/data/stations.sqlite
+      SUITE_ADDR: 0.0.0.0:8095
+    ports:
+      - "127.0.0.1:8095:8095"
+    volumes:
+      - ${POS_DATA_DIR:?set POS_DATA_DIR}:/srv/station/data
+    healthcheck:
+      test: ["CMD", "/srv/station/station-server", "--healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 10s
+    security_opt:
+      - no-new-privileges:true
