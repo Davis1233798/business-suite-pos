@@ -1,0 +1,3 @@
+
+/infra/oci/*.sh text eol=lf
+/infra/oci/*.yaml text eol=lf
