@@ -44,7 +44,7 @@ read -r key_type key_blob _ < "$KEY_FILE"
 for cmd in /usr/bin/python3 /usr/bin/docker /usr/bin/systemctl /usr/bin/loginctl /usr/sbin/sshd /usr/bin/newuidmap /usr/bin/rootlesskit /usr/bin/ssh-keygen; do [[ -x $cmd ]] || fail "missing prerequisite $cmd"; done
 command -v runuser >/dev/null || fail 'missing prerequisite runuser'
 command -v aa-status >/dev/null && aa-status --enabled || fail 'AppArmor must already be enabled'
-[[ -f /etc/apparmor.d/rootlesskit ]] && aa-status | grep -Fq rootlesskit || fail 'the shared rootlesskit AppArmor profile must already be loaded'
+[[ -f /etc/apparmor.d/rootlesskit ]] && aa-status | grep -F rootlesskit >/dev/null || fail 'the shared rootlesskit AppArmor profile must already be loaded'
 [[ -d /usr/local/libexec/mes-rootless && ! -L /usr/local/libexec/mes-rootless ]] || fail 'pinned rootless launcher directory unavailable'
 for launcher in /usr/local/libexec/mes-rootless/dockerd-rootless.sh /usr/local/libexec/mes-rootless/dockerd-rootless-setuptool.sh; do
   [[ -f $launcher && -x $launcher && $(stat -c '%u:%g:%a' "$launcher") == 0:0:755 ]] || fail 'pinned rootless launchers must be executable, immutable root-owned files'
