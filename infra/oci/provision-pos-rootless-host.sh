@@ -41,7 +41,8 @@ source /etc/os-release
 read -r key_type key_blob _ < "$KEY_FILE"
 [[ $key_type =~ ^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|ssh-rsa)$ && $key_blob =~ ^[A-Za-z0-9+/]+=*$ ]] || fail 'invalid OpenSSH public key'
 [[ -x /usr/bin/ssh-keygen ]] && ssh-keygen -lf "$KEY_FILE" >/dev/null 2>&1 || fail 'invalid OpenSSH public key'
-for cmd in /usr/bin/python3 /usr/bin/docker /usr/bin/systemctl /usr/bin/loginctl /usr/sbin/sshd /usr/bin/runuser /usr/bin/newuidmap /usr/bin/rootlesskit /usr/bin/ssh-keygen; do [[ -x $cmd ]] || fail "missing prerequisite $cmd"; done
+for cmd in /usr/bin/python3 /usr/bin/docker /usr/bin/systemctl /usr/bin/loginctl /usr/sbin/sshd /usr/bin/newuidmap /usr/bin/rootlesskit /usr/bin/ssh-keygen; do [[ -x $cmd ]] || fail "missing prerequisite $cmd"; done
+command -v runuser >/dev/null || fail 'missing prerequisite runuser'
 command -v aa-status >/dev/null && aa-status --enabled || fail 'AppArmor must already be enabled'
 [[ -f /etc/apparmor.d/rootlesskit ]] && aa-status | grep -Fq rootlesskit || fail 'the shared rootlesskit AppArmor profile must already be loaded'
 [[ -d /usr/local/libexec/mes-rootless && ! -L /usr/local/libexec/mes-rootless ]] || fail 'pinned rootless launcher directory unavailable'
