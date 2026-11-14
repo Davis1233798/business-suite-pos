@@ -58,7 +58,7 @@ if [[ -e $STATE ]]; then
   if [[ $owner == business-suite-pos/host-provisioner/v1 ]]; then
     [[ -d $LIB && ! -L $LIB && $(stat -c '%u:%g:%a' "$LIB") == 0:0:755 ]] || fail 'managed POS installation is incomplete'
     for file in deploy-release.sh ssh-gateway.sh compose.yaml; do cmp -s "$LIB/$file" "$REPO_ROOT/infra/oci/$file" || fail "installed POS program differs from source: $file"; done
-    [[ -f $HOME/.ssh/authorized_keys && $(stat -c '%u:%g:%a' "$HOME/.ssh/authorized_keys") == pos:pos:600 ]] || fail 'POS deployment key installation is incomplete'
+    [[ -f $HOME/.ssh/authorized_keys && $(stat -c '%U:%G:%a' "$HOME/.ssh/authorized_keys") == pos:pos:600 ]] || fail 'POS deployment key installation is incomplete'
     grep -Fqx "restrict,command=\"$GATEWAY\",no-port-forwarding,no-agent-forwarding,no-pty $key_type $key_blob" "$HOME/.ssh/authorized_keys" || fail 'refusing to replace an existing POS deployment key'
     if [[ $MODE == apply ]]; then bash "$SCRIPT_DIR/verify-pos-host-isolation.sh"; echo 'POS host already provisioned; No changes made.'; exit 0; fi
   elif [[ $MODE == check ]]; then
