@@ -40,7 +40,8 @@ source /etc/os-release
 [[ $(wc -l < "$KEY_FILE") == 1 ]] || fail 'operator public key file must contain exactly one line'
 read -r key_type key_blob _ < "$KEY_FILE"
 [[ $key_type =~ ^(ssh-ed25519|sk-ssh-ed25519@openssh.com|ecdsa-sha2-nistp256|ssh-rsa)$ && $key_blob =~ ^[A-Za-z0-9+/]+=*$ ]] || fail 'invalid OpenSSH public key'
-for cmd in /usr/bin/python3 /usr/bin/docker /usr/bin/systemctl /usr/bin/loginctl /usr/sbin/sshd /usr/bin/runuser /usr/bin/newuidmap /usr/bin/rootlesskit; do [[ -x $cmd ]] || fail "missing prerequisite $cmd"; done
+[[ -x /usr/bin/ssh-keygen ]] && ssh-keygen -lf "$KEY_FILE" >/dev/null 2>&1 || fail 'invalid OpenSSH public key'
+for cmd in /usr/bin/python3 /usr/bin/docker /usr/bin/systemctl /usr/bin/loginctl /usr/sbin/sshd /usr/bin/runuser /usr/bin/newuidmap /usr/bin/rootlesskit /usr/bin/ssh-keygen; do [[ -x $cmd ]] || fail "missing prerequisite $cmd"; done
 command -v aa-status >/dev/null && aa-status --enabled || fail 'AppArmor must already be enabled'
 [[ -f /etc/apparmor.d/rootlesskit ]] && aa-status | grep -Fq rootlesskit || fail 'the shared rootlesskit AppArmor profile must already be loaded'
 [[ -d /usr/local/libexec/mes-rootless && ! -L /usr/local/libexec/mes-rootless ]] || fail 'pinned rootless launcher directory unavailable'
@@ -95,17 +96,32 @@ else
   passwd -l "$ACCOUNT" >/dev/null
 fi
 chmod 0700 "$HOME"
-for db in /etc/subuid /etc/subgid; do
-  count=$(grep -c "^$ACCOUNT:" "$db" || true)
-  if (( count == 0 )); then
-    sub=${sub:-500000}
-    while awk -F: -v s="$sub" -v e="$((sub+65535))" '$2<=e && $2+$3-1>=s {found=1} END{exit !found}' /etc/subuid /etc/subgid 2>/dev/null; do sub=$((sub+65536)); done
-    (( sub+65535 < 4294967295 )) || fail 'no free POS subordinate ID range'
-    printf '%s:%s:65536\n' "$ACCOUNT" "$sub" >> "$db"
-  elif (( count != 1 )) || [[ $(grep "^$ACCOUNT:" "$db" | cut -d: -f3) != 65536 ]]; then
-    fail "partial POS subordinate ID mapping is inconsistent in $db"
-  fi
-done
+subuid_count=$(awk -F: -v name="$ACCOUNT" '$1==name {n++; value=$2 ":" $3} END{print n+0; if(n==1) print value}' /etc/subuid)
+subgid_count=$(awk -F: -v name="$ACCOUNT" '$1==name {n++; value=$2 ":" $3} END{print n+0; if(n==1) print value}' /etc/subgid)
+subuid_n=${subuid_count%%$'\n'*}; subuid_value=${subuid_count#*$'\n'}
+subgid_n=${subgid_count%%$'\n'*}; subgid_value=${subgid_count#*$'\n'}
+if (( subuid_n > 1 || subgid_n > 1 )); then fail 'partial POS subordinate ID mapping is duplicated'; fi
+if (( subuid_n == 1 && subgid_n == 1 )); then
+  [[ $subuid_value == "$subgid_value" && ${subuid_value#*:} == 65536 ]] || fail 'partial POS subordinate ID mappings do not match'
+  sub=${subuid_value%%:*}
+elif (( subuid_n == 1 || subgid_n == 1 )); then
+  existing=${subuid_n:+$subuid_value}; [[ $subuid_n == 1 ]] || existing=$subgid_value
+  [[ ${existing#*:} == 65536 ]] || fail 'partial POS subordinate ID mapping is not 65536 wide'
+  sub=${existing%%:*}
+  for db in /etc/subuid /etc/subgid; do
+    if ! grep -q "^$ACCOUNT:" "$db"; then
+      end=$((sub+65535))
+      awk -F: -v s="$sub" -v e="$end" '$2<=e && $2+$3-1>=s {found=1} END{exit !found}' "$db" && fail "partial POS subordinate ID range overlaps another mapping in $db"
+      printf '%s:%s:65536\n' "$ACCOUNT" "$sub" >> "$db"
+    fi
+  done
+else
+  sub=500000
+  while awk -F: -v s="$sub" -v e="$((sub+65535))" '$2<=e && $2+$3-1>=s {found=1} END{exit !found}' /etc/subuid /etc/subgid 2>/dev/null; do sub=$((sub+65536)); done
+  (( sub+65535 < 4294967295 )) || fail 'no free POS subordinate ID range'
+  printf '%s:%s:65536\n' "$ACCOUNT" "$sub" >> /etc/subuid
+  printf '%s:%s:65536\n' "$ACCOUNT" "$sub" >> /etc/subgid
+fi
 chown root:root /etc/subuid /etc/subgid; chmod 0644 /etc/subuid /etc/subgid
 if [[ -e $LIB || -L $LIB ]]; then
   [[ -d $LIB && ! -L $LIB && $(stat -c '%u:%g:%a' "$LIB") == 0:0:755 ]] || fail 'refusing to adopt unsafe POS program directory'
