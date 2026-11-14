@@ -14,7 +14,7 @@ POS is delivered as an immutable GHCR image for each main revision. CI builds an
 
 Pull requests run application tests, build both native images, and smoke-test each image without publishing or connecting to OCI. A push to `main` publishes architecture-suffixed commit tags, resolves the ARM64 registry manifest digest, and starts the private deployment job. The deployment job verifies that the commit remains the latest `main` revision before sending only the SHA and digest over SSH. GitHub Actions concurrency serializes releases.
 
-The SSH key is restricted by `authorized_keys` to `infra/oci/ssh-gateway.sh`; the gateway accepts only a validated `deploy <commit-sha> <sha256-digest>` request and invokes host-installed POS deployment files. The CI key cannot upload scripts or Compose files, request a shell, or forward ports. The host creates an immutable release directory, validates the image architecture and digest, starts the release on loopback, and checks `/api/health` for the expected revision. Only after health passes does it atomically update the `current` pointer. A failed deployment restores the prior release using its recorded digest and verifies prior health. A failed rollback is surfaced in the SSH job log; it does not alter persistent POS data.
+The SSH key is restricted by `authorized_keys` and `sshd` to the root-owned `/usr/local/lib/business-suite-pos/ssh-gateway.sh`; the gateway accepts only a validated `deploy <commit-sha> <sha256-digest>` request and invokes root-owned host-installed POS files. The CI key cannot upload scripts or Compose files, request a shell, or forward ports. The host creates an immutable release directory, validates the image architecture and digest, starts the release on loopback, and checks `/api/health` for the expected revision. Only after health passes does it atomically update the `current` pointer. A failed deployment restores the prior release using its recorded digest and verifies prior health. A failed rollback is surfaced in the SSH job log; it does not alter persistent POS data.
 
 ## Required GitHub secrets
 
@@ -28,15 +28,22 @@ Do not reuse the suite deployment key or suite environment file. Repository/work
 
 ## One-time OCI account setup
 
-Provision a dedicated `pos` account with rootless Docker Compose and a running user-level Docker service. Install `ssh-gateway.sh` as `/srv/business-suite-pos/shared/ssh-gateway.sh`, `deploy-release.sh` as `/srv/business-suite-pos/shared/deploy-release.sh`, and `compose.yaml` as `/srv/business-suite-pos/shared/compose.yaml`, all owned by `pos` and mode `0700` (Compose may be `0600`). Create `data`, `releases`, and `shared` as `pos`-owned mode `0700` directories. Do not install into or reuse the shared suite tree.
+Use the checked-in provisioner for one-time host setup. From a POS repository checkout on the target Ubuntu 24.04 ARM64 host, provide the deployment public key in a root-readable one-line file and run:
+
+```sh
+sudo bash infra/oci/provision-pos-rootless-host.sh --check --deploy-public-key-file /root/pos-deploy.pub
+sudo bash infra/oci/provision-pos-rootless-host.sh --apply --deploy-public-key-file /root/pos-deploy.pub
+```
+
+`--check` validates prerequisites and an existing installation without changing the host. `--apply` creates only the dedicated `pos` account, its rootless Docker service and POS data directories, installs the gateway/deployer/Compose files root-owned under `/usr/local/lib/business-suite-pos`, and configures the restricted SSH key and `sshd` policy. The provisioner refuses to adopt existing POS accounts, data paths, installation files, or unmarked partial state. An interrupted run leaves a versioned in-progress marker so the same version and key can safely resume. It does not deploy a container or change public ingress. The rootless daemon uses `/var/lib/pos/.docker` and `/run/user/<pos-uid>/docker.sock`; POS releases and data live under `/srv/business-suite-pos` with mode `0700`.
 
 Add the dedicated public key to the POS account's `~/.ssh/authorized_keys` with this restriction (replace the placeholder with the public key from `OCI_POS_DEPLOY_KEY`):
 
 ```text
-command="/srv/business-suite-pos/shared/ssh-gateway.sh",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 AAAA... POS-GITHUB-ACTIONS
+restrict,command="/usr/local/lib/business-suite-pos/ssh-gateway.sh" ssh-ed25519 AAAA... POS-GITHUB-ACTIONS
 ```
 
-The account needs a normal shell for the forced command to run, but this key cannot request that shell. Update the host-installed gateway, deploy script, or Compose file through a separately controlled POS host administration path when their logic changes; the CI key can only request releases by digest.
+The account needs a normal shell for the forced command to run, but this key cannot request that shell. Update the root-owned gateway, deploy script, or Compose file through a separately controlled POS host administration path when their logic changes; the CI key can only request releases by digest.
 
 ## Validation and operational caveats
 

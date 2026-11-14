@@ -11,7 +11,8 @@ readonly repository=ghcr.io/davis1233798/business-suite-pos-station
 readonly image="$repository@$digest"
 readonly release="$root/releases/$sha"
 readonly release_tmp="$root/releases/.${sha}.$$"
-readonly shared_compose="$root/shared/compose.yaml"
+shared_compose=/usr/local/lib/business-suite-pos/compose.yaml
+[[ -s $shared_compose ]] || shared_compose="$root/shared/compose.yaml"
 readonly data_dir="$root/data"
 
 [[ $(id -un) == pos ]] || { echo 'Deployment must run as the dedicated pos account' >&2; exit 3; }
@@ -32,7 +33,8 @@ export DOCKER_HOST="unix://$XDG_RUNTIME_DIR/docker.sock"
   echo 'POS runtime Compose configuration is not provisioned' >&2
   exit 3
 }
-install -d -m 700 "$root" "$root/releases" "$root/shared" "$data_dir"
+# The immutable host copy replaces the former writable shared/compose.yaml.
+install -d -m 700 "$root" "$root/releases" "$data_dir"
 exec 9>"$root/shared/deploy.lock"
 flock -n 9 || { echo 'Another POS deployment is running' >&2; exit 4; }
 
