@@ -6,7 +6,7 @@ The POS repository owns its image, OCI deployment workflow, rootless runtime pro
 
 ## Data and credential boundary
 
-The host account, `/srv/business-suite-pos` tree, rootless Docker context, Compose project name, host port, and application data directory are POS-specific. The deployment must not use `sudo`, access the root Docker socket, copy an environment file from another system, or remove persistent data. The public GHCR image does not need a registry credential. The CI SSH key is restricted to one forced-command gateway that accepts only a commit SHA and image digest; it cannot stage arbitrary code or request an interactive shell. Workflow secrets carry the POS SSH key, pinned host key, and SSH destination; these are separate from the other suite's deployment credentials.
+The host account, `/var/lib/pos` rootless Docker home, `/usr/local/lib/business-suite-pos` immutable host programs, `/srv/business-suite-pos` data tree, Compose project name, and host port are POS-specific. The deployment must not use `sudo`, access the root Docker socket, copy an environment file from another system, or remove persistent data. The public GHCR image does not need a registry credential. The CI SSH key is restricted to one forced-command gateway that accepts only a commit SHA and image digest; it cannot stage arbitrary code or request an interactive shell. Workflow secrets carry the POS SSH key, pinned host key, and SSH destination; these are separate from the other suite's deployment credentials.
 
 ## Network boundary
 
@@ -19,6 +19,6 @@ Each release records commit, complete image digest, and its Compose configuratio
 ## Acceptance sequence
 
 1. Validate the architecture and isolation design in `OCI_IMAGE_RELEASE.md`.
-2. Add regression checks for commit/digest validation, rootless-only commands, private loopback binding, release activation ordering, and exact-digest rollback.
+2. Add regression checks for commit/digest validation, rootless-only commands, private loopback binding, release activation ordering, exact-digest rollback, and fail-closed one-time host provisioning.
 3. Implement the deployment script, private runtime Compose file, and serialized main-only GitHub deployment workflow.
 4. Run the focused local checks and existing CI-equivalent application checks. No OCI deployment or production connection is part of local validation.
