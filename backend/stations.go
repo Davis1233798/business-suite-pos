@@ -136,6 +136,10 @@ func (a *App) stationAPI(w http.ResponseWriter, r *http.Request) {
 		a.posBarcode(w, r, id)
 		return
 	}
+	if action == "terminal" && site == "pos" {
+		a.posTerminal(w, r, id)
+		return
+	}
 	if action == "daily-report" && site == "pos" {
 		a.posDailyReport(w, r, id, g)
 		return
