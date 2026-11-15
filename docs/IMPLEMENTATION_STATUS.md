@@ -16,7 +16,7 @@
 
 新增管理員／後台精確收據查詢與單行分量退款。Go 依原折後 `line_total` 用累計整數分攤計算退款，僅允許現金銷售且原班仍開啟；POST 重新檢查資格、數量與商品，原子寫入退款、回庫、稽核及冪等結果。前端顯示伺服器資料推算的估值並標示估值，提交金額由伺服器決定。模糊結果會將原請求保存在同一瀏覽器分頁的 `sessionStorage`，以登入者組織／使用者 ID 分隔，重新載入後可原 payload/key 重試；不保存登入憑證，若無法先保存請求則不送出。保留原班關閉後不可退、非現金不可退及多行需分筆確認等限制。
 
-本次驗證：`go test ./... -count=1` 通過；cashier Playwright 序列重跑 27/27；refund-focused Playwright 8/8；`npx tsc --noEmit`、`npm run web:build`、`npx eslint web/src/PosRefunds.tsx` 與 `git diff --check` 通過。`playwright.lifecycle.config.ts` 等價測試對真實 Go 靜態伺服器 3/3 通過。另以獨立暫存 SQLite 和真實 Go API／瀏覽器執行折扣後淨額 101、數量 3 的兩次部分退款，瀏覽器確認伺服器退款分別為 33、34；SQLite 確認退款合計 67、已退數量 2、原商品庫存增加 2、退款／退款行／稽核／冪等記錄各 2。第一次合併 cashier suite 嘗試曾因一次掛單期望值失敗後出現 Vite 連線拒絕；改用序列、獨立埠重跑後 27/27 通過。真實資料僅存在隔離暫存資料庫；此分支未合併／部署，尚非完整 P01–P08 或生產驗收。設計及限制見 `docs/engineering/POS_REFUNDS.md`。
+本次驗證：`go test ./... -count=1` 通過；cashier Playwright 序列重跑 29/29；refund-focused Playwright 10/10；`npx tsc --noEmit`、`npm run web:build`、`npx eslint web/src/PosRefunds.tsx` 與 `git diff --check` 通過。`playwright.lifecycle.config.ts` 等價測試對真實 Go 靜態伺服器 3/3 通過。另以獨立暫存 SQLite 和真實 Go API／瀏覽器執行折扣後淨額 101、數量 3 的兩次部分退款，瀏覽器確認伺服器退款分別為 33、34；SQLite 確認退款合計 67、已退數量 2、原商品庫存增加 2、退款／退款行／稽核／冪等記錄各 2。第一次合併 cashier suite 嘗試曾因一次掛單期望值失敗後出現 Vite 連線拒絕；改用序列、獨立埠重跑後 27/27 通過。真實資料僅存在隔離暫存資料庫；此分支未合併／部署，尚非完整 P01–P08 或生產驗收。設計及限制見 `docs/engineering/POS_REFUNDS.md`。
 
 本次由目前 Codex 主代理與三個同模型子代理完成整合，未使用不可用的指定替代模型。
 

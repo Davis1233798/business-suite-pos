@@ -835,15 +835,15 @@ test('admin refund lookup submits a reviewed line quantity and shows the authori
   await expect(page.getByRole('heading', { name: 'Refunds' })).toBeVisible();
   await page.getByLabel('Receipt number').fill('POS-REFUND-001');
   await page.getByRole('button', { name: 'Find receipt' }).click();
-  await expect(page.getByLabel('Estimated refund')).toHaveText('$33');
+  await expect(page.getByLabel('Estimated refund')).toHaveText('NT$33');
   await page.getByLabel('Refund quantity').fill('1');
   await page.getByLabel('Refund reason').fill('Customer return');
   let confirmation = '';
   page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
   await page.getByRole('button', { name: 'Review refund' }).click();
   expect(confirmation).toContain('Coffee');
-  expect(confirmation).toContain('$33');
-  await expect(page.getByRole('status').filter({ hasText: 'REF-001' })).toContainText('$33');
+  expect(confirmation).toContain('NT$33');
+  await expect(page.getByRole('status').filter({ hasText: 'REF-001' })).toContainText('NT$33');
   await expect(page.getByText('2 remaining', { exact: true })).toBeVisible();
   expect(refundRequests).toHaveLength(1);
   expect(refundRequests[0]).not.toHaveProperty('refundAmount');
@@ -1005,4 +1005,45 @@ test('stale refund quantity rejection refreshes the exact receipt before another
   await expect(page.getByRole('button', { name: 'Retry refund' })).toHaveCount(0);
   expect(lookupCount).toBe(2);
   expect(postCount).toBe(1);
+});
+
+test('completed refund selects the next refundable line after refresh', async ({ page }) => {
+  let refundedFirstLine = false;
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: {
+    ...refundSale,
+    lines: [
+      { ...refundSale.lines[0], saleLineId: 'line-a', name: 'Coffee', quantity: 1, refundedQuantity: refundedFirstLine ? 1 : 0, remainingQuantity: refundedFirstLine ? 0 : 1, lineTotal: 100 },
+      { ...refundSale.lines[0], saleLineId: 'line-b', name: 'Tea', quantity: 1, refundedQuantity: 0, remainingQuantity: 1, lineTotal: 75 },
+    ],
+  } } }));
+  await page.route('**/api/stations/pos/business', async route => {
+    refundedFirstLine = true;
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-a', refundNumber: 'REF-NEXT', refundAmount: 100, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByLabel('Refund line')).toHaveValue('line-b');
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeEnabled();
+});
+
+test('rejected refund with unavailable receipt refresh stays clearly rejected', async ({ page }) => {
+  let lookupCount = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', async route => {
+    lookupCount += 1;
+    if (lookupCount > 1) return route.fulfill({ status: 503, json: { success: false, error: { message: 'Lookup unavailable' } } });
+    return route.fulfill({ json: { success: true, data: refundSale } });
+  });
+  await page.route('**/api/stations/pos/business', route => route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry' } } }));
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Refund was rejected, but receipt refresh failed');
+  await expect(page.getByRole('alert')).not.toContainText('Refund completed');
 });
