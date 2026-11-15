@@ -140,6 +140,10 @@ func (a *App) stationAPI(w http.ResponseWriter, r *http.Request) {
 		a.posTerminal(w, r, id)
 		return
 	}
+	if action == "held-carts" && site == "pos" {
+		a.posHeldCarts(w, r, id, g)
+		return
+	}
 	if action == "daily-report" && site == "pos" {
 		a.posDailyReport(w, r, id, g)
 		return

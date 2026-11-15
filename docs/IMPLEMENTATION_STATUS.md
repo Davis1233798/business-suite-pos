@@ -6,6 +6,12 @@
 
 本次驗證：`npm run go:test`、`npm test`、`npx tsc --noEmit`、`npx playwright test --config playwright.cashier.config.ts`（5/5）、`npm run web:build`、`npx eslint web/src/PosCashier.tsx` 與 `git diff --check` 通過。`web/src/main.tsx` 全檔 ESLint 仍有既存錯誤，新增路由段沒有 lint 診斷。尚未設計折讓原因、主管核准、促銷規則或折讓上限；完整端到端 P01–P08、離線交易、多工作站競爭及生產部署仍未完成／驗證。細節見 `docs/engineering/POS_CASHIER_UI.md` 與 `docs/engineering/POS_CART_LINE_DISCOUNTS.md`。
 
+## P04 掛單 UI 增量：2026-11-15（本機未合併）
+
+目前 `codex/pos-p04-held-carts` 工作樹增加掛單清單與暫存、競取、取回、釋出、修正及作廢。Go 僅列同店 held carts 和登入者自己的 retrieved carts；自己的已取回掛單在最多 100 筆清單中優先，方便重整後接續。更正由原 claim owner 提交，Go 依當前商品價格驗證並原子更新；作廢僅能由 claim owner 執行，記錄稽核及冪等結果，不建立銷售或扣庫。
+
+本分支驗證：`go test ./... -count=1` 通過；`npx playwright test --config=playwright.cashier.config.ts` 18/18；`npx tsc --noEmit`、`npm run web:build`、`npx eslint web/src/PosCashier.tsx` 與 `git diff --check` 通過。Playwright 競取為兩個瀏覽器 context 共用 mock API 狀態；真實 SQLite 競取仍由 Go API 測試覆蓋。Lifecycle 與真實 API 瀏覽器流程本次未能完成：測試環境未保留可檢查的隔離資料庫與服務記錄，且沒有正在監聽的測試 API。此工作尚未合併／部署；跨店轉移、關班後恢復、離線交易與完整 P01–P08 驗收未涵蓋。詳見 `docs/engineering/POS_HELD_CART_UI.md`。
+
 本次由目前 Codex 主代理與三個同模型子代理完成整合，未使用不可用的指定替代模型。
 
 已實作個人作品首頁、MES、ERP、POS、CRM、餐飲與電商前後台；使用真正 D1 持久化、訪客展示空間、模擬角色、原子庫存／付款／報工交易、種子重置、完整業務備份還原及 CSV。
