@@ -1047,3 +1047,39 @@ test('rejected refund with unavailable receipt refresh stays clearly rejected', 
   await expect(page.getByRole('alert')).toContainText('Refund was rejected, but receipt refresh failed');
   await expect(page.getByRole('alert')).not.toContainText('Refund completed');
 });
+
+test('ambiguous refund keeps its idempotency key across pre-handler errors and reload', async ({ page }) => {
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
+  const refundRequests: Record<string, any>[] = [];
+  const retryStatuses = [503, 401, 429, 403];
+  await page.route('**/api/stations/pos/business', async route => {
+    refundRequests.push(route.request().postDataJSON());
+    if (refundRequests.length <= retryStatuses.length) {
+      await route.fulfill({ status: retryStatuses[refundRequests.length - 1], json: { success: false, error: { message: 'Temporary request failure' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-auth-recovered', refundNumber: 'REF-AUTH-RECOVERED', refundAmount: 33, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Resolve the access or request issue');
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  for (const expectedStatus of [429, 403]) {
+    await page.getByRole('button', { name: 'Retry refund' }).click();
+    await expect(page.getByRole('alert')).toContainText('Resolve the access or request issue');
+    expect(retryStatuses[refundRequests.length - 1]).toBe(expectedStatus);
+  }
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'REF-AUTH-RECOVERED' })).toBeVisible();
+  expect(refundRequests).toHaveLength(5);
+  expect(refundRequests.every(request => request.idempotencyKey === refundRequests[0].idempotencyKey)).toBe(true);
+  expect(refundRequests.every(request => JSON.stringify(request) === JSON.stringify(refundRequests[0]))).toBe(true);
+});

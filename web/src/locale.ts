@@ -92,6 +92,7 @@ const traditionalChinese:Record<string,string> = {
   "Refund completed, but receipt refresh failed": "退款已完成，但收據更新失敗",
   "Refund was rejected, but receipt refresh failed": "退款遭拒，但收據更新失敗",
   "Refund outcome is unconfirmed. Retry the same refund to safely resolve it.": "退款結果尚未確認。請重試相同退款以安全確認結果。",
+  "Refund outcome is unconfirmed. Resolve the access or request issue, then retry the same refund.": "退款結果尚未確認。請先解決存取或請求問題，再重試相同退款。",
   "Refund response was incomplete": "退款回應資料不完整。",
   "Could not safely save this refund for retry": "無法安全儲存此退款以供重試。",
   "The saved refund request can be retried even while receipt details are unavailable.": "即使目前無法取得收據資料，仍可重試已儲存的退款請求。",
