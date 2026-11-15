@@ -11,10 +11,11 @@ type SaleReceipt = { saleId: string; receiptNumber: string; subtotal: number; di
 type HeldCartLine = { itemId: string; quantity: number; discountAmount: number; available: boolean; product: Product | null };
 type HeldCart = { cartId: string; cartName: string; heldAt: string; status: 'held' | 'retrieved'; lines: HeldCartLine[] };
 type HeldCartPage = { items: HeldCart[]; hasMore: boolean; nextCursor: string };
-type HeldOperation = { action: 'hold' | 'claim' | 'update' | 'release' | 'discard'; body: Record<string, unknown>; idempotencyKey: string };
+type HeldOperation = { action: 'hold' | 'claim' | 'update' | 'release' | 'discard'; body: Record<string, unknown>; idempotencyKey: string; basketSnapshot?: BasketLine[]; cartNameSnapshot?: string; claimedCartIdSnapshot?: string; uncertain?: boolean };
 type CashMovement = { movementId: string; shiftId: string; movementType: 'in' | 'out'; amount: number; reason: string };
 type ShiftCloseResult = { shiftId: string; status: 'closed'; expectedCash: number; closingCash: number; discrepancy: number };
 type ShiftOperation = { action: 'cash-movement' | 'close'; shiftId: string; idempotencyKey: string; movementType?: 'in' | 'out'; amount?: number; reason?: string; closingCash?: number; notes?: string };
+type CheckoutOperation = { body: { action: 'checkout'; shiftId: string; cartId?: string; lines?: Array<{ itemId: string; quantity: number; discountAmount: number }>; tender: number; idempotencyKey: string }; basketSnapshot: BasketLine[]; claimedCartId: string; cartName: string; uncertain?: boolean };
 const HELD_CART_PAGE_SIZE = 50;
 
 class ApiError extends Error {
@@ -33,6 +34,8 @@ function post<T>(path: string, body: unknown) {
 }
 
 function shiftOperationStorageKey(ownerKey: string) { return `pos-shift-operation:${encodeURIComponent(ownerKey)}`; }
+function heldOperationStorageKey(ownerKey: string) { return `pos-held-operation:${encodeURIComponent(ownerKey)}`; }
+function checkoutOperationStorageKey(ownerKey: string) { return `pos-checkout-operation:${encodeURIComponent(ownerKey)}`; }
 function readShiftOperation(storageKey: string): ShiftOperation | null {
   try {
     const raw = sessionStorage.getItem(storageKey);
@@ -42,13 +45,40 @@ function readShiftOperation(storageKey: string): ShiftOperation | null {
   } catch { /* malformed/stale local data is never treated as an authorized operation */ }
   return null;
 }
+function readHeldOperation(storageKey: string): HeldOperation | null {
+  try {
+    const raw = sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<HeldOperation>;
+    const actions: HeldOperation['action'][] = ['hold', 'claim', 'update', 'release', 'discard'];
+    if (value.action && actions.includes(value.action) && value.body && typeof value.body === 'object' && typeof value.idempotencyKey === 'string' && value.idempotencyKey.length >= 8) return { ...value as HeldOperation, uncertain: true };
+  } catch { /* malformed/stale local data is never treated as an authorized operation */ }
+  return null;
+}
+function readCheckoutOperation(storageKey: string): CheckoutOperation | null {
+  try {
+    const raw = sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<CheckoutOperation>;
+    if (value.body?.action === 'checkout' && typeof value.body.shiftId === 'string' && Number.isSafeInteger(value.body.tender) && typeof value.body.idempotencyKey === 'string' && value.body.idempotencyKey.length >= 8 && Array.isArray(value.basketSnapshot) && typeof value.claimedCartId === 'string' && typeof value.cartName === 'string') return { ...value as CheckoutOperation, uncertain: true };
+  } catch { /* malformed/stale local data is never treated as an authorized operation */ }
+  return null;
+}
 function money(value: number) { return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'TWD', maximumFractionDigits: 0 }).format(value); }
 function utf8Length(value: string) { return new TextEncoder().encode(value).length; }
+function hasAmbiguousOutcome(error: unknown) {
+  return !(error instanceof ApiError) || error.status >= 500 || [401, 403, 408, 419, 429].includes(error.status);
+}
 
 export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string }) {
   const shiftOperationKey = shiftOperationStorageKey(ownerKey);
+  const heldOperationKey = heldOperationStorageKey(ownerKey);
+  const checkoutOperationKey = checkoutOperationStorageKey(ownerKey);
   const [pendingShiftOperation, setPendingShiftOperation] = useState<ShiftOperation | null>(() => readShiftOperation(shiftOperationKey));
   const pendingShiftOperationRef = useRef<ShiftOperation | null>(pendingShiftOperation);
+  const [pendingHeldOperation, setPendingHeldOperation] = useState<HeldOperation | null>(() => readHeldOperation(heldOperationKey));
+  const [pendingCheckout, setPendingCheckout] = useState<CheckoutOperation | null>(() => readCheckoutOperation(checkoutOperationKey));
+  const pendingCheckoutRef = useRef<CheckoutOperation | null>(pendingCheckout);
   const writable = role !== 'readonly' && pendingShiftOperation === null;
   const [movementType, setMovementType] = useState<'in' | 'out'>(() => pendingShiftOperation?.action === 'cash-movement' ? pendingShiftOperation.movementType || 'in' : 'in');
   const [movementAmount, setMovementAmount] = useState(() => pendingShiftOperation?.action === 'cash-movement' ? String(pendingShiftOperation.amount ?? '') : '');
@@ -61,10 +91,10 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const [registerId, setRegisterId] = useState('');
   const [openingCash, setOpeningCash] = useState('0');
   const [barcode, setBarcode] = useState('');
-  const [basket, setBasket] = useState<BasketLine[]>([]);
-  const [tender, setTender] = useState('');
+  const [basket, setBasket] = useState<BasketLine[]>(() => pendingCheckout?.basketSnapshot || pendingHeldOperation?.basketSnapshot || []);
+  const [tender, setTender] = useState(() => pendingCheckout ? String(pendingCheckout.body.tender) : '');
   const [busy, setBusy] = useState(false);
-  const [checkoutUncertain, setCheckoutUncertain] = useState(false);
+  const [checkoutUncertain, setCheckoutUncertain] = useState(() => pendingCheckout !== null);
   const [openShiftUncertain, setOpenShiftUncertain] = useState(false);
   const [heldCarts, setHeldCarts] = useState<HeldCart[]>([]);
   const [heldCartsShiftId, setHeldCartsShiftId] = useState('');
@@ -74,16 +104,16 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const [heldCartsErrorShiftId, setHeldCartsErrorShiftId] = useState('');
   const [heldCartsHasMore, setHeldCartsHasMore] = useState(false);
   const [heldCartsNextCursor, setHeldCartsNextCursor] = useState('');
-  const [cartName, setCartName] = useState('');
-  const [claimedCartId, setClaimedCartId] = useState('');
+  const [cartName, setCartName] = useState(() => pendingCheckout?.cartName || pendingHeldOperation?.cartNameSnapshot || '');
+  const [claimedCartId, setClaimedCartId] = useState(() => pendingCheckout?.claimedCartId || pendingHeldOperation?.claimedCartIdSnapshot || '');
   const [heldCartDirty, setHeldCartDirty] = useState(false);
-  const [cartOperationUncertain, setCartOperationUncertain] = useState(false);
-  const [cartOperationAction, setCartOperationAction] = useState<HeldOperation['action'] | ''>('');
+  const [cartOperationUncertain, setCartOperationUncertain] = useState(() => pendingHeldOperation !== null);
+  const [cartOperationAction, setCartOperationAction] = useState<HeldOperation['action'] | ''>(() => pendingHeldOperation?.action || '');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [receipt, setReceipt] = useState<SaleReceipt | null>(null);
-  const retryKey = useRef('');
-  const heldOperation = useRef<HeldOperation | null>(null);
+  const retryKey = useRef(pendingCheckout?.body.idempotencyKey || '');
+  const heldOperation = useRef<HeldOperation | null>(pendingHeldOperation);
   const heldReadSequence = useRef(0);
   const writeLock = useRef(false);
   const openShiftKey = useRef('');
@@ -131,6 +161,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const closeDiscrepancyEstimate = Number.isSafeInteger(parsedClosingCash) && activeShift ? parsedClosingCash - expectedDrawerCash : null;
   const varianceReasonBytes = utf8Length(varianceNotes.trim());
   const shiftOperationLocked = pendingShiftOperation !== null;
+  const shiftCloseBlocked = checkoutUncertain || pendingCheckout !== null || cartOperationUncertain || pendingHeldOperation !== null || basket.length > 0 || claimedCartId !== '' || heldCartDirty;
 
   function clearShiftOperation() {
     pendingShiftOperationRef.current = null;
@@ -144,6 +175,35 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
     pendingShiftOperationRef.current = operation;
     setPendingShiftOperation(operation);
     return true;
+  }
+
+  function saveHeldOperation(operation: HeldOperation) {
+    try { sessionStorage.setItem(heldOperationKey, JSON.stringify(operation)); }
+    catch { setError(tr('Could not safely save this cart request for retry')); return false; }
+    heldOperation.current = operation;
+    setPendingHeldOperation(operation);
+    return true;
+  }
+
+  function clearHeldOperation() {
+    heldOperation.current = null;
+    setPendingHeldOperation(null);
+    try { sessionStorage.removeItem(heldOperationKey); } catch { /* stale replay remains idempotent */ }
+  }
+
+  function saveCheckoutOperation(operation: CheckoutOperation) {
+    try { sessionStorage.setItem(checkoutOperationKey, JSON.stringify(operation)); }
+    catch { setError(tr('Could not safely save this sale for retry')); return false; }
+    pendingCheckoutRef.current = operation;
+    setPendingCheckout(operation);
+    retryKey.current = operation.body.idempotencyKey;
+    return true;
+  }
+
+  function clearCheckoutOperation() {
+    pendingCheckoutRef.current = null;
+    setPendingCheckout(null);
+    try { sessionStorage.removeItem(checkoutOperationKey); } catch { /* stale replay remains idempotent */ }
   }
 
   async function runShiftOperation(operation = pendingShiftOperationRef.current) {
@@ -194,7 +254,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   function recordCashMovement() {
-    if (!activeShift || !writable || shiftOperationLocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200) return;
+    if (!activeShift || !writable || shiftOperationLocked || shiftCloseBlocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200) return;
     const operation: ShiftOperation = {
       action: 'cash-movement', shiftId: activeShift.id, movementType: movementType,
       amount: parsedMovementAmount, reason: movementReason.trim(), idempotencyKey: `cash-movement-${crypto.randomUUID()}`,
@@ -203,7 +263,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   function closeShift() {
-    if (!activeShift || !writable || shiftOperationLocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000) return;
+    if (!activeShift || !writable || shiftOperationLocked || shiftCloseBlocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000) return;
     const notes = varianceNotes.trim();
     if (closeDiscrepancyEstimate !== 0 && (!notes || varianceReasonBytes > 200)) return;
     if (notes && varianceReasonBytes > 200) return;
@@ -294,14 +354,13 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
     return () => window.clearTimeout(timer);
   }, [activeShiftId, refreshHeldCarts]);
 
-  async function runHeldOperation() {
-    const operation = heldOperation.current;
+  async function runHeldOperation(operation = heldOperation.current) {
     if (!operation || writeLock.current) return;
     writeLock.current = true;
     setBusy(true); setError(''); setMessage('');
     try {
       await post('/api/stations/pos/cart', { ...operation.body, idempotencyKey: operation.idempotencyKey });
-      heldOperation.current = null;
+      clearHeldOperation();
       setCartOperationUncertain(false); setCartOperationAction('');
       if (operation.action === 'hold') {
         setBasket([]); setTender(''); setCartName(''); setReceipt(null); retryKey.current = '';
@@ -341,14 +400,17 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         try { await refreshHeldCarts(shiftId); } catch (reason) { setHeldCartsError((reason as Error).message); }
       }
     } catch (reason) {
-      if (!(reason instanceof ApiError) || reason.status >= 500) {
+      const provenNotApplied = reason instanceof ApiError && reason.outcome === 'not_applied';
+      const keepForRetry = !provenNotApplied && (operation.uncertain === true || hasAmbiguousOutcome(reason));
+      if (keepForRetry) {
+        saveHeldOperation({ ...operation, uncertain: true });
         setCartOperationUncertain(true);
         setCartOperationAction(operation.action);
         setError(tr('Cart operation outcome is unconfirmed. Retry the same request before changing it.'));
       } else {
-        heldOperation.current = null;
+        clearHeldOperation();
         setCartOperationUncertain(false); setCartOperationAction('');
-        if (operation.action === 'claim' && reason.status === 409) {
+        if (operation.action === 'claim' && reason instanceof ApiError && reason.status === 409) {
           try { await refreshHeldCarts(String(operation.body.shiftId || '')); } catch { /* keep the conflict visible */ }
           setError(tr('Another cashier claimed this cart. The held list was refreshed.'));
         } else {
@@ -359,10 +421,14 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   function beginHeldOperation(action: HeldOperation['action'], body: Record<string, unknown>) {
-    if (writeLock.current || cartOperationUncertain || !activeShift) return;
-    heldOperation.current = { action, body: structuredClone(body), idempotencyKey: `cart-${crypto.randomUUID()}` };
+    if (writeLock.current || cartOperationUncertain || checkoutUncertain || pendingCheckoutRef.current || !activeShift) return;
+    const operation: HeldOperation = {
+      action, body: structuredClone(body), idempotencyKey: `cart-${crypto.randomUUID()}`,
+      basketSnapshot: structuredClone(basket), cartNameSnapshot: cartName, claimedCartIdSnapshot: claimedCartId,
+    };
+    if (!saveHeldOperation(operation)) return;
     setCartOperationAction(action);
-    void runHeldOperation();
+    void runHeldOperation(operation);
   }
 
   function holdBasket() {
@@ -443,7 +509,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   async function openShift() {
-    if (!registerId || !Number.isSafeInteger(Number(openingCash)) || Number(openingCash) < 0) return;
+    if (shiftCloseBlocked || !registerId || !Number.isSafeInteger(Number(openingCash)) || Number(openingCash) < 0) return;
     setBusy(true); setError(''); setMessage('');
     if (!openShiftKey.current) openShiftKey.current = `open-${crypto.randomUUID()}`;
     try {
@@ -522,45 +588,65 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   async function checkout() {
-    if (!activeShift || !basket.length || heldCartDirty || heldDiscountNeedsCorrection || heldStockNeedsCorrection || basket.some(line => line.item.isActive === false) || !Number.isSafeInteger(tenderAmount) || tenderAmount < total || writeLock.current || cartOperationUncertain) return;
+    const pending = pendingCheckoutRef.current;
+    if (pending) {
+      await runCheckout(pending);
+      return;
+    }
+    if (!activeShift || !basket.length || heldCartDirty || heldDiscountNeedsCorrection || heldStockNeedsCorrection || basket.some(line => line.item.isActive === false) || !Number.isSafeInteger(tenderAmount) || tenderAmount < total || writeLock.current || cartOperationUncertain || pendingHeldOperation) return;
+    const idempotencyKey = `sale-${crypto.randomUUID()}`;
+    const body: CheckoutOperation['body'] = {
+      action: 'checkout', shiftId: activeShift.id,
+      ...(claimedCartId ? { cartId: claimedCartId } : { lines: basket.map(line => ({ itemId: line.item.id, quantity: line.quantity, discountAmount: line.discountAmount })) }),
+      tender: tenderAmount, idempotencyKey,
+    };
+    const operation: CheckoutOperation = { body, basketSnapshot: structuredClone(basket), claimedCartId, cartName };
+    if (!saveCheckoutOperation(operation)) return;
+    setCheckoutUncertain(false);
+    await runCheckout(operation);
+  }
+
+  async function runCheckout(operation: CheckoutOperation) {
+    if (writeLock.current) return;
     writeLock.current = true;
     setBusy(true); setError(''); setMessage('');
-    if (!retryKey.current) retryKey.current = `sale-${crypto.randomUUID()}`;
     try {
-      const result = await post<SaleReceipt>('/api/stations/pos/cart', {
-        action: 'checkout', shiftId: activeShift.id,
-        ...(claimedCartId ? { cartId: claimedCartId } : { lines: basket.map(line => ({ itemId: line.item.id, quantity: line.quantity, discountAmount: line.discountAmount })) }),
-        tender: tenderAmount, idempotencyKey: retryKey.current,
-      });
+      const result = await post<SaleReceipt>('/api/stations/pos/cart', operation.body);
+      clearCheckoutOperation();
       setReceipt(result); setBasket([]); setTender(''); retryKey.current = '';
-      const completedHeldCart = claimedCartId;
+      const completedHeldCart = operation.claimedCartId;
       setClaimedCartId(''); setHeldCartDirty(false); setCartName('');
       setCheckoutUncertain(false);
       setMessage(tr('Sale complete'));
       if (completedHeldCart) {
-        try { await refreshHeldCarts(activeShift.id); } catch (reason) { setHeldCartsError((reason as Error).message); }
+        try { await refreshHeldCarts(operation.body.shiftId); } catch (reason) { setHeldCartsError((reason as Error).message); }
       }
       try { await refreshTerminal(); } catch (reason) { setError(`${tr('Sale completed; shift status refresh failed:')} ${(reason as Error).message}`); }
       requestAnimationFrame(() => scanInput.current?.focus());
     } catch (reason) {
       // Preserve the exact request after an ambiguous outcome; only replay it.
-      if (!(reason instanceof ApiError) || reason.status >= 500) {
+      const provenNotApplied = reason instanceof ApiError && reason.outcome === 'not_applied';
+      const keepForRetry = !provenNotApplied && (operation.uncertain === true || hasAmbiguousOutcome(reason));
+      if (keepForRetry) {
+        const retryOperation = { ...operation, uncertain: true };
+        saveCheckoutOperation(retryOperation);
         setCheckoutUncertain(true);
         setError(tr('Checkout outcome is unconfirmed. Retry this exact sale before changing it.'));
       } else {
+        clearCheckoutOperation();
         retryKey.current = '';
         setCheckoutUncertain(false);
         let claimedCartRefresh: boolean | null = null;
-        if (claimedCartId && reason instanceof ApiError && [400, 404, 409].includes(reason.status)) {
+        if (operation.claimedCartId && reason instanceof ApiError && [400, 404, 409].includes(reason.status)) {
           try {
-            claimedCartRefresh = await refreshClaimedCartProducts(activeShift.id, claimedCartId);
+            claimedCartRefresh = await refreshClaimedCartProducts(operation.body.shiftId, operation.claimedCartId);
           } catch { /* keep the validation error visible */ }
         }
         const refreshFeedback = claimedCartRefresh === true
           ? tr('Current item details were refreshed. Review the basket and save any corrections before retrying.')
           : claimedCartRefresh === false
             ? tr('The claimed cart was not present in the refreshed list. Refresh and verify its status before retrying.')
-            : claimedCartId
+            : operation.claimedCartId
               ? tr('Current item details could not be refreshed. Refresh the held list and verify the claim before retrying.')
               : '';
         setError(`${(reason as Error).message}${refreshFeedback ? `. ${refreshFeedback}` : ''}`);
@@ -583,6 +669,11 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
       <p>{tr('Shift operation outcome is unconfirmed. Retry the exact request with the same key before changing it.')}</p>
       <button type="button" onClick={() => void runShiftOperation()} disabled={busy}>{tr('Retry')} {tr(pendingShiftOperation.action === 'close' ? 'close shift' : 'cash movement')}</button>
     </section>}
+    {cartOperationUncertain && <section className="pos-cashier-panel pos-shift-retry" role="group" aria-label={tr('Unconfirmed cart operation')}>
+      <p>{tr('Cart operation outcome is unconfirmed. Retry the same request before changing it.')}</p>
+      <button type="button" onClick={() => void runHeldOperation()} disabled={busy}>{tr('Retry')} {tr(cartOperationAction || 'cart operation')}</button>
+    </section>}
+    {checkoutUncertain && <p className="pos-cashier-note" role="status">{tr('Checkout outcome is unconfirmed. Retry this exact sale before changing it.')}</p>}
 
     {!activeShift && <section className="pos-cashier-panel pos-shift-open" aria-label={tr('Open a cashier shift')}>
       <h2>{tr('Open shift')}</h2>
@@ -591,17 +682,13 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         {terminal?.registers.map(register => <option key={register.id} value={register.id}>{register.name}</option>)}
       </select></label>
       <label>{tr('Opening cash')}<input aria-label={tr('Opening cash')} inputMode="numeric" type="number" min="0" step="1" value={openingCash} onChange={event => setOpeningCash(event.target.value)} disabled={!writable || busy || openShiftUncertain}/></label>
-      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || !registerId}>{openShiftUncertain ? tr('Retry opening shift') : tr('Open shift')}</button>
+      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || shiftCloseBlocked || !registerId}>{openShiftUncertain ? tr('Retry opening shift') : tr('Open shift')}</button>
       {!writable && <p>{tr('Read-only access cannot open a shift or complete sales.')}</p>}
     </section>}
 
     {activeShift && <section className="pos-cashier-panel pos-held-carts" aria-label={tr('Held carts')}>
       <div className="pos-held-heading"><h2>{tr('Held carts')}</h2><button type="button" className="pos-secondary" onClick={() => void refreshHeldCarts(activeShift.id).catch(() => undefined)} disabled={busy || cartOperationUncertain || heldCartsLoading}>{heldCartsLoading ? tr('Refreshing') : tr('Refresh held carts')}</button></div>
       {visibleHeldCartsError && <p className="pos-cashier-note" role="status">{tr('Cannot load held carts')}. {visibleHeldCartsError}</p>}
-      {cartOperationUncertain && <div className="pos-held-retry" role="group" aria-label={tr('Unconfirmed cart operation')}>
-        <p>{tr('Cart operation outcome is unconfirmed. Retry the same request before changing it.')}</p>
-        <button type="button" onClick={() => void runHeldOperation()} disabled={busy}>{tr('Retry')} {tr(cartOperationAction || 'cart operation')}</button>
-      </div>}
       {visibleHeldCarts.length === 0 && !visibleHeldCartsError && <p className="pos-cashier-empty">{visibleHeldCartsLoading ? tr('Loading held carts') : tr('No held carts for this shift.')}</p>}
       <ul className="pos-held-list">
         {visibleHeldCarts.map(cart => <li key={cart.cartId}>
@@ -618,14 +705,14 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
       <section className="pos-cashier-panel pos-cash-drawer" aria-label={tr('Cash movement')}>
         <h2>{tr('Cash movement')}</h2>
         <p className="pos-cashier-note">{tr('Current expected cash (server estimate)')}: <strong>{money(expectedDrawerCash)}</strong></p>
-        <label>{tr('Cash movement type')}<select aria-label={tr('Cash movement type')} value={movementType} onChange={event => setMovementType(event.target.value as 'in' | 'out')} disabled={!writable || busy || shiftOperationLocked}>
+        <label>{tr('Cash movement type')}<select aria-label={tr('Cash movement type')} value={movementType} onChange={event => setMovementType(event.target.value as 'in' | 'out')} disabled={!writable || busy || shiftOperationLocked || shiftCloseBlocked}>
           <option value="in">{tr('Cash in')}</option><option value="out">{tr('Cash out')}</option>
         </select></label>
-        <label>{tr('Movement amount')}<input aria-label={tr('Movement amount')} inputMode="numeric" type="number" min="1" max={movementMaxAmount} step="1" value={movementAmount} onChange={event => setMovementAmount(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
-        <label>{tr('Movement reason')}<textarea aria-label={tr('Movement reason')} maxLength={200} value={movementReason} onChange={event => setMovementReason(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
+        <label>{tr('Movement amount')}<input aria-label={tr('Movement amount')} inputMode="numeric" type="number" min="1" max={movementMaxAmount} step="1" value={movementAmount} onChange={event => setMovementAmount(event.target.value)} disabled={!writable || busy || shiftOperationLocked || shiftCloseBlocked}/></label>
+        <label>{tr('Movement reason')}<textarea aria-label={tr('Movement reason')} maxLength={200} value={movementReason} onChange={event => setMovementReason(event.target.value)} disabled={!writable || busy || shiftOperationLocked || shiftCloseBlocked}/></label>
         {movementReasonBytes > 200 && <p className="pos-cashier-error" role="alert">{tr('Reason must be 200 UTF-8 bytes or fewer.')}</p>}
         <p className="pos-cashier-note">{movementType === 'out' ? `${tr('Cash out available')}: ${money(expectedDrawerCash)}` : tr('Cash in and out amounts are confirmed by the server.')}</p>
-        <button type="button" onClick={recordCashMovement} disabled={!writable || busy || shiftOperationLocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200}>{tr('Record cash movement')}</button>
+        <button type="button" onClick={recordCashMovement} disabled={!writable || busy || shiftOperationLocked || shiftCloseBlocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200}>{tr('Record cash movement')}</button>
         {!writable && !shiftOperationLocked && <p className="pos-cashier-note">{tr('Read-only access cannot change the cash drawer.')}</p>}
       </section>
       <section className="pos-cashier-panel pos-shift-close" aria-label={tr('Close shift')}>
@@ -634,7 +721,8 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         <label>{tr('Counted closing cash')}<input aria-label={tr('Counted closing cash')} inputMode="numeric" type="number" min="0" max="1000000000" step="1" value={closingCash} onChange={event => setClosingCash(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
         {closeDiscrepancyEstimate !== null && <p className="pos-cashier-note">{tr('Variance estimate')}: {closeDiscrepancyEstimate < 0 ? tr('Short') : closeDiscrepancyEstimate > 0 ? tr('Over') : tr('Balanced')} {money(Math.abs(closeDiscrepancyEstimate))} · {tr('The server calculates the final variance.')}</p>}
         <label>{tr('Variance explanation')}<textarea aria-label={tr('Variance explanation')} maxLength={200} value={varianceNotes} onChange={event => setVarianceNotes(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
-        <button type="button" onClick={closeShift} disabled={!writable || busy || shiftOperationLocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000 || (closeDiscrepancyEstimate !== 0 && (!varianceNotes.trim() || varianceReasonBytes > 200)) || (!!varianceNotes.trim() && varianceReasonBytes > 200)}>{tr('Review and close shift')}</button>
+        {shiftCloseBlocked && <p className="pos-cashier-note">{tr('Resolve the current sale or cart before closing the shift.')}</p>}
+        <button type="button" onClick={closeShift} disabled={!writable || busy || shiftOperationLocked || shiftCloseBlocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000 || (closeDiscrepancyEstimate !== 0 && (!varianceNotes.trim() || varianceReasonBytes > 200)) || (!!varianceNotes.trim() && varianceReasonBytes > 200)}>{tr('Review and close shift')}</button>
         {shiftCloseResult && <div className="pos-receipt"><strong>{tr('Shift closed')}</strong><span>{tr('Expected cash')}: {money(shiftCloseResult.expectedCash)}</span><span>{tr('Counted cash')}: {money(shiftCloseResult.closingCash)}</span><span>{tr('Variance')}: {shiftCloseResult.discrepancy}</span></div>}
         {!writable && !shiftOperationLocked && <p className="pos-cashier-note">{tr('Read-only access cannot close a shift.')}</p>}
       </section>
@@ -681,7 +769,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         <div className="pos-money-row"><span>{tr('Cash change')}</span><strong>{tr('Cash change')} ${change}</strong></div>
         {heldDiscountNeedsCorrection && <p className="pos-cashier-error" role="status">{tr('A saved discount exceeds the current price. Adjust it and save the cart before checkout.')}</p>}
         {heldStockNeedsCorrection && <p className="pos-cashier-error" role="status">{tr('Current stock is below the held quantity. Adjust the quantity and save the cart before checkout.')}</p>}
-        <button type="button" className="pos-checkout" onClick={() => void checkout()} disabled={!writable || busy || cartOperationUncertain || !activeShift || !basket.length || heldCartDirty || heldDiscountNeedsCorrection || heldStockNeedsCorrection || basket.some(line => line.item.isActive === false) || !Number.isSafeInteger(tenderAmount) || tenderAmount < total}>{checkoutUncertain ? tr('Retry same sale') : tr('Complete cash sale')}</button>
+        <button type="button" className="pos-checkout" onClick={() => void checkout()} disabled={!writable || busy || cartOperationUncertain || (!pendingCheckout && (!activeShift || !basket.length || heldCartDirty || heldDiscountNeedsCorrection || heldStockNeedsCorrection || basket.some(line => line.item.isActive === false) || !Number.isSafeInteger(tenderAmount) || tenderAmount < total))}>{checkoutUncertain ? tr('Retry same sale') : tr('Complete cash sale')}</button>
         {receipt && <div className="pos-receipt" role="status"><strong>{tr('Receipt')} {receipt.receiptNumber}</strong><span>{tr('Subtotal')} ${receipt.subtotal}</span><span>{tr('Discount')} -${receipt.discountAmount}</span><span>{tr('Total due')} ${receipt.totalAmount}</span><span>{tr('Cash change')} ${receipt.changeAmount}</span><span>{tr('Receipt amounts are calculated by the POS server.')}</span></div>}
       </section>
     </div>

@@ -61,6 +61,12 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
       await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary checkout failure' } } });
       return;
     }
+    const retryStatuses = [429, 403, 409];
+    if (checkoutRequests.length <= retryStatuses.length + 1) {
+      const status = retryStatuses[checkoutRequests.length - 2];
+      await route.fulfill({ status, json: { success: false, error: { message: `Unmarked checkout response ${status}` } } });
+      return;
+    }
     await route.fulfill({ json: { success: true, data: {
       saleId: 'sale-a', receiptNumber: 'POS-RECEIPT-A', subtotal: 200, discountAmount: 10,
       totalAmount: 190, changeAmount: 10,
@@ -98,16 +104,35 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   await page.getByLabel('Cash tendered').fill('200');
   await expect(page.locator('.pos-money-total')).toContainText('$190');
   await expect(page.locator('.pos-money-row').last()).toContainText('$10');
+  await page.getByLabel('Counted closing cash').fill('1000');
   await page.getByRole('button', { name: 'Complete cash sale' }).click();
   await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
   await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
   await expect(page.getByLabel('Cash tendered')).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  await page.reload();
+  await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  await expect(page.getByLabel('Cash tendered')).toHaveValue('200');
+  await expect(page.getByRole('button', { name: 'Retry same sale' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  for (let retry = 0; retry < 3; retry++) {
+    await page.getByRole('button', { name: 'Retry same sale' }).click();
+    await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+    await expect(page.getByRole('button', { name: 'Retry same sale' })).toBeVisible();
+    expect(checkoutRequests[checkoutRequests.length - 1]).toEqual(checkoutRequests[0]);
+    expect(checkoutRequests).toHaveLength(retry + 2);
+    if (retry === 0) {
+      await page.reload();
+      await expect(page.getByRole('button', { name: 'Retry same sale' })).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+    }
+  }
   await page.getByRole('button', { name: 'Retry same sale' }).click();
   await expect(page.getByText('POS-RECEIPT-A')).toBeVisible();
   await expect(page.locator('.pos-receipt').getByText('Change $10')).toBeVisible();
-  expect(checkoutRequests).toHaveLength(2);
+  expect(checkoutRequests).toHaveLength(5);
   expect(checkoutRequests[0]).toMatchObject({ action: 'checkout', shiftId: 'shift-a', tender: 200 });
-  expect(checkoutRequests[1]).toEqual(checkoutRequests[0]);
+  expect(checkoutRequests.slice(1).every(request => JSON.stringify(request) === JSON.stringify(checkoutRequests[0]))).toBe(true);
   expect(checkoutRequests[0].lines).toEqual([{ itemId: product.id, quantity: 2, discountAmount: 10 }]);
   expect(checkoutRequests[0]).not.toHaveProperty('total');
 });
@@ -307,10 +332,14 @@ test('ambiguous hold retries the exact named discounted basket with the same ide
   await page.route('**/api/stations/pos/barcode?**', route => route.fulfill({ json: { success: true, data: product } }));
   await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: [] } }));
   const requests: Record<string, any>[] = [];
+  const retryStatuses = [429, 403, 409];
   await page.route('**/api/stations/pos/cart', async route => {
     requests.push(route.request().postDataJSON());
     if (requests.length === 1) {
       await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary failure' } } });
+    } else if (requests.length <= retryStatuses.length + 1) {
+      const status = retryStatuses[requests.length - 2];
+      await route.fulfill({ status, json: { success: false, error: { message: `Unmarked cart response ${status}` } } });
     } else {
       await route.fulfill({ json: { success: true, data: { cartId: 'cart-retry', status: 'held' } } });
     }
@@ -321,14 +350,73 @@ test('ambiguous hold retries the exact named discounted basket with the same ide
   await page.getByLabel('Discount Cold brew coffee').fill('10');
   await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('10');
   await page.getByLabel('Cart name').fill('Retry basket');
+  await page.getByLabel('Counted closing cash').fill('1000');
   await page.getByRole('button', { name: 'Hold basket' }).click();
   await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
   await expect(page.getByLabel('Cart name')).toBeDisabled();
   await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  await page.reload();
+  await expect(page.getByLabel('Cart name')).toHaveValue('Retry basket');
+  await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  await expect(page.getByRole('button', { name: 'Retry hold' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  for (let retry = 0; retry < 3; retry++) {
+    await page.getByRole('button', { name: 'Retry hold' }).click();
+    await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+    await expect(page.getByRole('button', { name: 'Retry hold' })).toBeVisible();
+    expect(requests[requests.length - 1]).toEqual(requests[0]);
+    expect(requests).toHaveLength(retry + 2);
+    if (retry === 0) {
+      await page.reload();
+      await expect(page.getByRole('button', { name: 'Retry hold' })).toBeVisible();
+      await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+    }
+  }
   await page.getByRole('button', { name: 'Retry hold' }).click();
   await expect(page.locator('.pos-basket li')).toHaveCount(0);
+  expect(requests).toHaveLength(5);
+  expect(requests.slice(1).every(request => JSON.stringify(request) === JSON.stringify(requests[0]))).toBe(true);
+});
+
+test('unconfirmed held-cart claim blocks shift close and recovers its original request after reload', async ({ page }) => {
+  const held = { cartId: 'cart-claim-retry', cartName: 'Claim retry basket', heldAt: '2026-11-15T10:00:00Z', status: 'held', lines: [
+    { itemId: product.id, quantity: 1, discountAmount: 0, available: true, product },
+  ] };
+  let claimed = false;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [{ ...openCashShift }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => {
+    const cartId = new URL(route.request().url()).searchParams.get('cartId');
+    const row = cartId ? { ...held, status: 'retrieved' } : claimed ? { ...held, status: 'retrieved' } : held;
+    return route.fulfill({ json: { success: true, data: { items: [row], hasMore: false, nextCursor: '' } } });
+  });
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Claim outcome is unconfirmed' } } });
+      return;
+    }
+    claimed = true;
+    await route.fulfill({ json: { success: true, data: { cartId: held.cartId, status: 'retrieved' } } });
+  });
+  await cashier(page);
+  await page.getByLabel('Counted closing cash').fill('1000');
+  await page.getByRole('button', { name: `Claim ${held.cartName}` }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  const original = requests[0];
+  await page.reload();
+  await page.getByLabel('Counted closing cash').fill('1000');
+  await expect(page.getByRole('button', { name: 'Retry claim' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  await page.getByRole('button', { name: 'Retry claim' }).click();
+  await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  await page.getByLabel('Discount Cold brew coffee').fill('5');
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
   expect(requests).toHaveLength(2);
-  expect(requests[1]).toEqual(requests[0]);
+  expect(requests[1]).toEqual(original);
 });
 
 test('independent cashier contexts race to claim one shared cart and only the winner can check it out', async ({ browser }) => {

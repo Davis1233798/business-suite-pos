@@ -10,15 +10,15 @@ import (
 
 type posCommand struct {
 	Action         string `json:"action"`
-	MovementType   string `json:"movementType"`
+	MovementType   string `json:"movementType,omitempty"`
 	RegisterID     string `json:"registerId"`
 	ShiftID        string `json:"shiftId"`
 	ItemID         string `json:"itemId"`
 	SaleLineID     string `json:"saleLineId"`
 	Reason         string `json:"reason"`
-	Notes          string `json:"notes"`
+	Notes          string `json:"notes,omitempty"`
 	Quantity       int    `json:"quantity"`
-	Amount         int64  `json:"amount"`
+	Amount         int64  `json:"amount,omitempty"`
 	OpeningCash    int64  `json:"openingCash"`
 	ClosingCash    int64  `json:"closingCash"`
 	Tender         int64  `json:"tender"`
