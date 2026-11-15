@@ -1,4 +1,5 @@
 CREATE UNIQUE INDEX IF NOT EXISTS idempotency_scope_unique ON idempotency_keys(organization_id, key, endpoint);
+CREATE INDEX IF NOT EXISTS pos_sales_receipt_lookup ON pos_sales(organization_id, receipt_number);
 --> statement-breakpoint
 CREATE TRIGGER IF NOT EXISTS pos_stock_nonnegative BEFORE UPDATE OF stock_quantity ON pos_catalog_items WHEN NEW.stock_quantity < 0 BEGIN SELECT RAISE(ABORT, 'Insufficient stock'); END;
 --> statement-breakpoint

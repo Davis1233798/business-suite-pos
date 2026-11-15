@@ -79,6 +79,12 @@
 
 另保留 `POST /api/pos/refund` 舊端點，使用同一服務退款；新客戶端使用 `/actions`。
 
+### Go POS station refund flow
+
+`GET /api/stations/pos/refund-lookup?receiptNumber=...` requires an enabled `admin` / `back` grant. It returns the matching organization's receipt, original sale/shift/payment eligibility, and at most 100 sale lines with sold/refunded/remaining quantity and original net line amount. Closed-original-shift, non-cash, non-completed, and fully refunded sales are returned as `eligible:false`. Unknown and foreign-organization receipts both return 404. Duplicate receipt numbers and sales exceeding the line bound return 409.
+
+`POST /api/stations/pos/business` with `{action:"refund",saleLineId,quantity,reason,idempotencyKey}` also requires `admin` / `back`. It refunds one sale line, computes the final prorated amount from the original discounted line total, restores the original item stock, and atomically records the refund, audit and idempotency result. The original shift must still be open and the sale must be cash-paid; the lookup is advisory and POST revalidates. A same-key replay returns the original result, while reusing the key with a different payload returns 409.
+
 ## CRM
 
 `POST /api/crm/lead/convert`：`leadId`, 可選 `dealAmount` 非負整數、`closeDate`。原子建立客戶、聯絡人與商機，已轉換時回相同關聯。

@@ -148,6 +148,10 @@ func (a *App) stationAPI(w http.ResponseWriter, r *http.Request) {
 		a.posDailyReport(w, r, id, g)
 		return
 	}
+	if action == "refund-lookup" && site == "pos" {
+		a.posRefundLookup(w, r, id, g)
+		return
+	}
 	if action == "cart" && site == "pos" {
 		a.posCart(w, r, id, g)
 		return

@@ -32,7 +32,11 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		return
 	}
 	var in posCommand
-	if body(r, &in) != nil || len(in.IdempotencyKey) < 8 || len(in.IdempotencyKey) > 128 || len(in.RegisterID) > 256 || len(in.ShiftID) > 256 || len(in.ItemID) > 256 || len(in.SaleLineID) > 256 || len(in.Reason) > 200 {
+	if body(r, &in) != nil {
+		fail(w, 400, "Invalid point-of-sale request")
+		return
+	}
+	if len(in.IdempotencyKey) < 8 || len(in.IdempotencyKey) > 128 || (in.Action != "refund" && (len(in.RegisterID) > 256 || len(in.ShiftID) > 256 || len(in.ItemID) > 256 || len(in.SaleLineID) > 256 || len(in.Reason) > 200)) {
 		fail(w, 400, "Invalid point-of-sale request")
 		return
 	}
@@ -42,10 +46,6 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 	}
 	if in.Action == "refund" && (grant.Role != "admin" || grant.Scope != "back") {
 		fail(w, 403, "Refunds require a back-office administrator")
-		return
-	}
-	if in.Action == "refund" && (in.SaleLineID == "" || in.Quantity < 1 || in.Quantity > 1000 || strings.TrimSpace(in.Reason) == "") {
-		fail(w, 400, "Select a sale line, quantity and reason")
 		return
 	}
 	if in.OpeningCash < 0 || in.ClosingCash < 0 || in.Tender < 0 || in.OpeningCash > 1000000000 || in.ClosingCash > 1000000000 || in.Tender > 1000000000 {
@@ -70,10 +70,20 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 	raw, _ := json.Marshal(in)
 	fingerprint := digest(id.UserID + "\x00" + string(raw))
 	var priorHash, priorBody string
-	e = tx.QueryRow("SELECT request_hash,response_body FROM idempotency_keys WHERE organization_id=? AND key=? AND endpoint=?", id.OrganizationID, in.IdempotencyKey, endpoint).Scan(&priorHash, &priorBody)
+	var priorStatus int
+	e = tx.QueryRow("SELECT request_hash,response_status,response_body FROM idempotency_keys WHERE organization_id=? AND key=? AND endpoint=?", id.OrganizationID, in.IdempotencyKey, endpoint).Scan(&priorHash, &priorStatus, &priorBody)
 	if e == nil {
 		if priorHash != fingerprint {
 			fail(w, 409, "Retry key was used for a different request")
+			return
+		}
+		if priorStatus != http.StatusOK {
+			var envelope map[string]any
+			if json.Unmarshal([]byte(priorBody), &envelope) != nil {
+				fail(w, 500, "Invalid stored result")
+				return
+			}
+			writeJSON(w, priorStatus, envelope)
 			return
 		}
 		var result map[string]any
@@ -86,6 +96,10 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 	}
 	if !errors.Is(e, sql.ErrNoRows) {
 		fail(w, 503, "Cannot read retry state")
+		return
+	}
+	if in.Action == "refund" && (len(in.RegisterID) > 256 || len(in.ShiftID) > 256 || len(in.ItemID) > 256 || len(in.SaleLineID) > 256 || len(in.Reason) > 200 || in.SaleLineID == "" || in.Quantity < 1 || in.Quantity > 1000 || strings.TrimSpace(in.Reason) == "") {
+		terminalPOSRefundRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 400, "Select a sale line, quantity and reason within the supported limits", false)
 		return
 	}
 	result := map[string]any{}
@@ -181,23 +195,27 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		result = map[string]any{"saleId": entityID, "receiptNumber": receipt, "totalAmount": total, "changeAmount": change}
 	case "refund":
-		var saleID, itemID, shiftStatus, saleStatus string
+		var saleID, itemID, shiftStatus, saleStatus, paymentMethod string
 		var sold, refunded int
 		var lineTotal int64
-		e = tx.QueryRow(`SELECT l.sale_id,l.item_id,l.quantity,l.refunded_quantity,l.line_total,s.status,sh.status FROM pos_sale_lines l JOIN pos_sales s ON s.id=l.sale_id AND s.organization_id=l.organization_id JOIN pos_shifts sh ON sh.id=s.shift_id AND sh.organization_id=s.organization_id WHERE l.id=? AND l.organization_id=?`, in.SaleLineID, id.OrganizationID).Scan(&saleID, &itemID, &sold, &refunded, &lineTotal, &saleStatus, &shiftStatus)
+		e = tx.QueryRow(`SELECT l.sale_id,l.item_id,l.quantity,l.refunded_quantity,l.line_total,s.status,sh.status,s.payment_method FROM pos_sale_lines l JOIN pos_sales s ON s.id=l.sale_id AND s.organization_id=l.organization_id JOIN pos_shifts sh ON sh.id=s.shift_id AND sh.organization_id=s.organization_id WHERE l.id=? AND l.organization_id=?`, in.SaleLineID, id.OrganizationID).Scan(&saleID, &itemID, &sold, &refunded, &lineTotal, &saleStatus, &shiftStatus, &paymentMethod)
 		if errors.Is(e, sql.ErrNoRows) {
-			fail(w, 404, "Sale line not found")
+			terminalPOSRefundRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, http.StatusNotFound, "Sale line not found", false)
 			return
 		}
 		if e != nil {
 			fail(w, 503, "Cannot read sale line")
 			return
 		}
-		if saleStatus != "completed" || shiftStatus != "open" || sold < 1 || sold > 1000000 || refunded < 0 || in.Quantity > sold-refunded || lineTotal < 0 || lineTotal > 1000000000 {
-			fail(w, 409, "Refund exceeds the remaining quantity or the original shift is closed")
+		if saleStatus != "completed" || shiftStatus != "open" || paymentMethod != "cash" || sold < 1 || sold > 1000000 || refunded < 0 || in.Quantity > sold-refunded || lineTotal < 0 || lineTotal > 1000000000 {
+			terminalPOSRefundRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Sale is not eligible for refund: it must be completed, paid in cash, on an open original shift, and have remaining quantity", false)
 			return
 		}
 		amount := lineTotal*int64(refunded+in.Quantity)/int64(sold) - lineTotal*int64(refunded)/int64(sold)
+		if _, err := tx.Exec("SAVEPOINT refund_business"); err != nil {
+			fail(w, 503, "Could not protect refund transaction")
+			return
+		}
 		update, err := tx.Exec("UPDATE pos_sale_lines SET refunded_quantity=refunded_quantity+? WHERE id=? AND organization_id=? AND refunded_quantity+?<=quantity", in.Quantity, in.SaleLineID, id.OrganizationID, in.Quantity)
 		if err != nil {
 			fail(w, 503, "Could not update refund quantity")
@@ -205,7 +223,7 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		n, err := update.RowsAffected()
 		if err != nil || n != 1 {
-			fail(w, 409, "Refund quantity changed; retry")
+			terminalPOSRefundRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Refund quantity changed; retry", true)
 			return
 		}
 		update, err = tx.Exec("UPDATE pos_catalog_items SET stock_quantity=stock_quantity+? WHERE id=? AND organization_id=?", in.Quantity, itemID, id.OrganizationID)
@@ -215,7 +233,7 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		n, err = update.RowsAffected()
 		if err != nil || n != 1 {
-			fail(w, 409, "Original product no longer exists")
+			terminalPOSRefundRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Original product no longer exists", true)
 			return
 		}
 		entityID = "refund_" + token()
@@ -284,4 +302,27 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		return
 	}
 	ok(w, result)
+}
+
+func terminalPOSRefundRejection(w http.ResponseWriter, tx *sql.Tx, organizationID, key, endpoint, fingerprint string, status int, message string, rollbackBusiness bool) {
+	if rollbackBusiness {
+		if _, err := tx.Exec("ROLLBACK TO SAVEPOINT refund_business"); err != nil {
+			fail(w, 503, "Could not roll back rejected refund")
+			return
+		}
+		if _, err := tx.Exec("RELEASE SAVEPOINT refund_business"); err != nil {
+			fail(w, 503, "Could not finish rejected refund")
+			return
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"success": false, "error": map[string]string{"message": message, "outcome": "not_applied"}})
+	if _, err := tx.Exec("INSERT INTO idempotency_keys(id,organization_id,key,endpoint,request_hash,response_status,response_body) VALUES(?,?,?,?,?,?,?)", "idem_"+token(), organizationID, key, endpoint, fingerprint, status, string(body)); err != nil {
+		fail(w, 503, "Unable to save refund rejection retry state")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		fail(w, 503, "Could not save refund rejection")
+		return
+	}
+	writeJSON(w, status, map[string]any{"success": false, "error": map[string]string{"message": message, "outcome": "not_applied"}})
 }
