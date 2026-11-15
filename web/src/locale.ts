@@ -180,6 +180,8 @@ const traditionalChinese:Record<string,string> = {
   "Refresh held carts": "重新整理掛單",
   "Refreshing": "重新整理中",
   "Loading held carts": "正在載入掛單",
+  "Load more held carts": "載入更多掛單",
+  "Loading more held carts": "正在載入更多掛單",
   "No held carts for this shift.": "此班次目前沒有掛單。",
   "Held at": "暫存時間",
   "items": "個品項",

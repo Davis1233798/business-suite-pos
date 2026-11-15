@@ -413,11 +413,18 @@ test('confirmed claim remains recoverable when the post-claim list read fails', 
   } } }));
   const held = { cartId: 'cart-read-retry', cartName: 'Read retry order', heldAt: '2026-11-15T10:00:00Z', status: 'held',
     lines: [{ itemId: product.id, quantity: 1, discountAmount: 0, available: true, product }] };
-  let reads = 0;
+  let listReads = 0;
+  let targetReads = 0;
   await page.route('**/api/stations/pos/held-carts?**', async route => {
-    reads += 1;
-    if (reads === 2) await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary list failure' } } });
-    else await route.fulfill({ json: { success: true, data: reads === 1 ? [held] : [{ ...held, status: 'retrieved' }] } });
+    const url = new URL(route.request().url());
+    if (url.searchParams.has('cartId')) {
+      targetReads += 1;
+      if (targetReads === 1) await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary target read failure' } } });
+      else await route.fulfill({ json: { success: true, data: { items: [{ ...held, status: 'retrieved' }], hasMore: false, nextCursor: '' } } });
+    } else {
+      listReads += 1;
+      await route.fulfill({ json: { success: true, data: { items: listReads === 1 ? [held] : [{ ...held, status: 'retrieved' }], hasMore: false, nextCursor: '' } } });
+    }
   });
   const actions: Record<string, any>[] = [];
   await page.route('**/api/stations/pos/cart', async route => {
@@ -434,7 +441,8 @@ test('confirmed claim remains recoverable when the post-claim list read fails', 
   await page.getByRole('button', { name: 'Resume Read retry order' }).click();
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
   expect(actions).toHaveLength(1);
-  expect(reads).toBe(4);
+  expect(listReads).toBe(3);
+  expect(targetReads).toBe(2);
 });
 
 test('ambiguous claim and release retries replay identical payloads and preserve the claimed basket', async ({ page }) => {
@@ -588,14 +596,22 @@ test('held checkout rejection reports when the refreshed list no longer contains
   await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
     registers: [register], openShifts: [{ id: 'shift-a', registerId: register.id, storeId: register.storeId, openingCash: 1000 }],
   } } }));
-  let reads = 0;
+  let listReads = 0;
+  let targetReads = 0;
   let claimed = false;
-  await page.route('**/api/stations/pos/held-carts?**', route => {
-    reads += 1;
-    if (reads === 3) return route.fulfill({ json: { success: true, data: [] } });
+  await page.route('**/api/stations/pos/held-carts?**', async route => {
+    const url = new URL(route.request().url());
+    if (url.searchParams.has('cartId')) {
+      targetReads += 1;
+      const row = { cartId: 'cart-no-longer-listed', cartName: 'Vanished claim', heldAt: '2026-11-15T10:00:00Z', status: 'retrieved',
+        lines: [{ itemId: product.id, quantity: 1, discountAmount: 0, available: true, product }] };
+      await route.fulfill({ json: { success: true, data: { items: targetReads === 1 ? [row] : [], hasMore: false, nextCursor: '' } } });
+      return;
+    }
+    listReads += 1;
     const row = { cartId: 'cart-no-longer-listed', cartName: 'Vanished claim', heldAt: '2026-11-15T10:00:00Z', status: claimed ? 'retrieved' : 'held',
       lines: [{ itemId: product.id, quantity: 1, discountAmount: 0, available: true, product }] };
-    return route.fulfill({ json: { success: true, data: [row] } });
+    await route.fulfill({ json: { success: true, data: { items: [row], hasMore: false, nextCursor: '' } } });
   });
   await page.route('**/api/stations/pos/cart', async route => {
     const body = route.request().postDataJSON();
@@ -618,7 +634,8 @@ test('held checkout rejection reports when the refreshed list no longer contains
   await expect(alert).not.toContainText('Current item details were refreshed');
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
   await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('0');
-  expect(reads).toBe(3);
+  expect(listReads).toBe(2);
+  expect(targetReads).toBe(2);
 });
 
 test('held checkout stock conflict refreshes stock and preserves quantity until corrected and saved', async ({ page }) => {
@@ -739,4 +756,46 @@ test('one-line cart with a missing item cannot be checked out and requires expli
   await expect(page.getByText('Missing item order')).toHaveCount(0);
   expect(discardRequests).toHaveLength(2);
   expect(discardRequests[1]).toEqual(discardRequests[0]);
+});
+
+test('held-cart pages expose older owned claims and resume them through a scoped cart read', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
+    registers: [register], openShifts: [{ id: 'shift-a', registerId: register.id, storeId: register.storeId, openingCash: 1000 }],
+  } } }));
+  const cart = (index: number) => ({
+    cartId: `cart-retrieved-${index}`, cartName: `Recovered order ${index}`, heldAt: `2026-11-15T10:${String(index % 60).padStart(2, '0')}:00Z`, status: 'retrieved',
+    lines: [{ itemId: product.id, quantity: 1, discountAmount: 0, available: true, product }],
+  });
+  const firstPage = Array.from({ length: 50 }, (_, index) => cart(index));
+  const olderClaim = cart(50);
+  const cursors: string[] = [];
+  let targetedRead = false;
+  await page.route('**/api/stations/pos/held-carts?**', async route => {
+    const url = new URL(route.request().url());
+    const cartId = url.searchParams.get('cartId');
+    if (cartId) {
+      expect(cartId).toBe(olderClaim.cartId);
+      targetedRead = true;
+      await route.fulfill({ json: { success: true, data: { items: [olderClaim], hasMore: false, nextCursor: '' } } });
+      return;
+    }
+    const cursor = url.searchParams.get('cursor') || '';
+    cursors.push(cursor);
+    if (!cursor) {
+      expect(url.searchParams.get('limit')).toBe('50');
+      await route.fulfill({ json: { success: true, data: { items: firstPage, hasMore: true, nextCursor: 'next-page-token' } } });
+      return;
+    }
+    expect(cursor).toBe('next-page-token');
+    await route.fulfill({ json: { success: true, data: { items: [olderClaim], hasMore: false, nextCursor: '' } } });
+  });
+  await cashier(page);
+  await expect(page.getByRole('button', { name: 'Resume Recovered order 50' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Load more held carts' })).toBeVisible();
+  await page.getByRole('button', { name: 'Load more held carts' }).click();
+  await expect(page.getByRole('button', { name: 'Resume Recovered order 50' })).toBeVisible();
+  await page.getByRole('button', { name: 'Resume Recovered order 50' }).click();
+  await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
+  expect(cursors).toEqual(['', 'next-page-token']);
+  expect(targetedRead).toBe(true);
 });

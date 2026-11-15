@@ -10,7 +10,9 @@ type BasketLine = { item: Product; quantity: number; discountAmount: number };
 type SaleReceipt = { saleId: string; receiptNumber: string; subtotal: number; discountAmount: number; totalAmount: number; changeAmount: number };
 type HeldCartLine = { itemId: string; quantity: number; discountAmount: number; available: boolean; product: Product | null };
 type HeldCart = { cartId: string; cartName: string; heldAt: string; status: 'held' | 'retrieved'; lines: HeldCartLine[] };
+type HeldCartPage = { items: HeldCart[]; hasMore: boolean; nextCursor: string };
 type HeldOperation = { action: 'hold' | 'claim' | 'update' | 'release' | 'discard'; body: Record<string, unknown>; idempotencyKey: string };
+const HELD_CART_PAGE_SIZE = 50;
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
@@ -45,6 +47,8 @@ export function PosCashier({ role }: { role: string }) {
   const [heldCartsLoadingShiftId, setHeldCartsLoadingShiftId] = useState('');
   const [heldCartsError, setHeldCartsError] = useState('');
   const [heldCartsErrorShiftId, setHeldCartsErrorShiftId] = useState('');
+  const [heldCartsHasMore, setHeldCartsHasMore] = useState(false);
+  const [heldCartsNextCursor, setHeldCartsNextCursor] = useState('');
   const [cartName, setCartName] = useState('');
   const [claimedCartId, setClaimedCartId] = useState('');
   const [heldCartDirty, setHeldCartDirty] = useState(false);
@@ -91,8 +95,20 @@ export function PosCashier({ role }: { role: string }) {
   const change = Number.isSafeInteger(tenderAmount) && tenderAmount >= total ? tenderAmount - total : 0;
   const activeShift = terminal?.openShifts.find(shift => shift.id === activeShiftId);
   const visibleHeldCarts = activeShift && heldCartsShiftId === activeShift.id ? heldCarts : [];
+  const visibleHeldCartsHasMore = !!activeShift && heldCartsShiftId === activeShift.id && heldCartsHasMore;
   const visibleHeldCartsError = activeShift && heldCartsErrorShiftId === activeShift.id ? heldCartsError : '';
   const visibleHeldCartsLoading = activeShift && heldCartsLoadingShiftId === activeShift.id && heldCartsLoading;
+
+  const readHeldCartPage = useCallback(async (shiftId: string, cursor = '', cartId = '') => {
+    const query = new URLSearchParams({ shiftId });
+    if (cartId) query.set('cartId', cartId);
+    else {
+      query.set('limit', String(HELD_CART_PAGE_SIZE));
+      if (cursor) query.set('cursor', cursor);
+    }
+    const result = await api<HeldCartPage | HeldCart[]>(`/api/stations/pos/held-carts?${query.toString()}`);
+    return Array.isArray(result) ? { items: result, hasMore: false, nextCursor: '' } : result;
+  }, []);
 
   const refreshHeldCarts = useCallback(async (shiftId: string) => {
     const sequence = ++heldReadSequence.current;
@@ -101,12 +117,14 @@ export function PosCashier({ role }: { role: string }) {
     setHeldCartsError('');
     setHeldCartsErrorShiftId('');
     try {
-      const result = await api<HeldCart[]>(`/api/stations/pos/held-carts?shiftId=${encodeURIComponent(shiftId)}`);
+      const result = await readHeldCartPage(shiftId);
       if (sequence === heldReadSequence.current) {
-        setHeldCarts(result);
+        setHeldCarts(result.items);
         setHeldCartsShiftId(shiftId);
+        setHeldCartsHasMore(result.hasMore);
+        setHeldCartsNextCursor(result.nextCursor);
       }
-      return result;
+      return result.items;
     } catch (reason) {
       if (sequence === heldReadSequence.current) {
         setHeldCartsError(tr('Could not refresh held carts. Try again.'));
@@ -116,7 +134,40 @@ export function PosCashier({ role }: { role: string }) {
     } finally {
       if (sequence === heldReadSequence.current) setHeldCartsLoading(false);
     }
-  }, []);
+  }, [readHeldCartPage]);
+
+  const loadMoreHeldCarts = useCallback(async (shiftId: string) => {
+    const cursor = heldCartsNextCursor;
+    if (!cursor || !heldCartsHasMore || heldCartsLoading || heldCartsShiftId !== shiftId) return;
+    const sequence = ++heldReadSequence.current;
+    setHeldCartsLoading(true);
+    setHeldCartsLoadingShiftId(shiftId);
+    setHeldCartsError('');
+    setHeldCartsErrorShiftId('');
+    try {
+      const result = await readHeldCartPage(shiftId, cursor);
+      if (sequence === heldReadSequence.current) {
+        setHeldCarts(current => {
+          const seen = new Set(current.map(cart => cart.cartId));
+          return [...current, ...result.items.filter(cart => !seen.has(cart.cartId))];
+        });
+        setHeldCartsHasMore(result.hasMore);
+        setHeldCartsNextCursor(result.nextCursor);
+      }
+    } catch {
+      if (sequence === heldReadSequence.current) {
+        setHeldCartsError(tr('Could not refresh held carts. Try again.'));
+        setHeldCartsErrorShiftId(shiftId);
+      }
+    } finally {
+      if (sequence === heldReadSequence.current) setHeldCartsLoading(false);
+    }
+  }, [heldCartsHasMore, heldCartsLoading, heldCartsNextCursor, heldCartsShiftId, readHeldCartPage]);
+
+  const readOwnedHeldCart = useCallback(async (shiftId: string, cartId: string) => {
+    const result = await readHeldCartPage(shiftId, '', cartId);
+    return result.items.find(cart => cart.cartId === cartId && cart.status === 'retrieved');
+  }, [readHeldCartPage]);
 
   useEffect(() => {
     if (!activeShiftId) {
@@ -143,13 +194,14 @@ export function PosCashier({ role }: { role: string }) {
         const cartId = String(operation.body.cartId || '');
         const shiftId = String(operation.body.shiftId || '');
         let cart: HeldCart | undefined;
-        try { cart = (await refreshHeldCarts(shiftId)).find(candidate => candidate.cartId === cartId && candidate.status === 'retrieved'); }
+        try { cart = await readOwnedHeldCart(shiftId, cartId); }
         catch { /* claim is confirmed; owner can refresh to recover its persisted snapshot */ }
         if (!cart) {
           setClaimedCartId(cartId);
           setHeldCarts(current => current.map(candidate => candidate.cartId === cartId ? { ...candidate, status: 'retrieved' } : candidate));
           setMessage(tr('Claim succeeded but the cart snapshot is unavailable. Refresh before continuing.'));
         } else {
+          setHeldCarts(current => current.map(candidate => candidate.cartId === cartId ? cart! : candidate));
           restoreHeldCart(cart);
           setMessage(cart.lines.some(line => !line.available)
             ? tr('Basket retrieved with unavailable items. Remove them before saving or checkout.')
@@ -157,6 +209,7 @@ export function PosCashier({ role }: { role: string }) {
               ? tr('A saved discount exceeds the current price. Adjust it and save the cart before checkout.')
               : tr('Basket retrieved'));
         }
+        try { await refreshHeldCarts(shiftId); } catch { /* keep the confirmed claim and restored snapshot available */ }
       } else if (operation.action === 'update') {
         setHeldCartDirty(false);
         setMessage(tr('Held cart changes saved'));
@@ -229,9 +282,9 @@ export function PosCashier({ role }: { role: string }) {
     }
     if (!activeShift) return;
     try {
-      const refreshed = await refreshHeldCarts(activeShift.id);
-      const current = refreshed.find(candidate => candidate.cartId === cart.cartId && candidate.status === 'retrieved');
+      const current = await readOwnedHeldCart(activeShift.id, cart.cartId);
       if (!current) throw new Error(tr('The claimed cart is no longer available to resume. Refresh the held list.'));
+      setHeldCarts(carts => carts.map(candidate => candidate.cartId === cart.cartId ? current : candidate));
       restoreHeldCart(current);
       setMessage(current.lines.some(line => !line.available)
         ? tr('Basket retrieved with unavailable items. Remove them before saving or checkout.')
@@ -244,8 +297,7 @@ export function PosCashier({ role }: { role: string }) {
   }
 
   async function refreshClaimedCartProducts(shiftId: string, cartId: string) {
-    const refreshed = await refreshHeldCarts(shiftId);
-    const current = refreshed.find(cart => cart.cartId === cartId && cart.status === 'retrieved');
+    const current = await readOwnedHeldCart(shiftId, cartId);
     if (!current) return false;
     const currentLines = new Map(current.lines.map(line => [line.itemId, line]));
     setBasket(lines => lines.map(line => {
@@ -438,6 +490,7 @@ export function PosCashier({ role }: { role: string }) {
           <button type="button" onClick={() => claimCart(cart)} disabled={!writable || busy || cartOperationUncertain || (!!claimedCartId && (cart.cartId !== claimedCartId || basket.length > 0)) || (!claimedCartId && basket.length > 0)} aria-label={`${tr(cart.status === 'retrieved' ? 'Resume' : 'Claim')} ${cart.cartName}`}>{tr(cart.status === 'retrieved' ? 'Resume' : 'Claim')} {cart.cartName}</button>
         </li>)}
       </ul>
+      {visibleHeldCartsHasMore && <button type="button" className="pos-secondary" onClick={() => void loadMoreHeldCarts(activeShift.id)} disabled={busy || cartOperationUncertain || heldCartsLoading}>{heldCartsLoading ? tr('Loading more held carts') : tr('Load more held carts')}</button>}
     </section>}
 
     <div className="pos-cashier-grid">

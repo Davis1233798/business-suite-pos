@@ -74,29 +74,33 @@ func TestPOSHeldCartListIsScopedAndExposesOnlyHeldCartSnapshot(t *testing.T) {
 		t.Fatalf("list held carts: %d %s", code, body)
 	}
 	var response struct {
-		Data []struct {
-			CartID   string `json:"cartId"`
-			CartName string `json:"cartName"`
-			Status   string `json:"status"`
-			Lines    []struct {
-				ItemID         string `json:"itemId"`
-				Quantity       int64  `json:"quantity"`
-				DiscountAmount int64  `json:"discountAmount"`
-				Available      bool   `json:"available"`
-				Product        struct {
-					Name          string `json:"name"`
-					Barcode       string `json:"barcode"`
-					Price         int64  `json:"price"`
-					StockQuantity int64  `json:"stockQuantity"`
-				} `json:"product"`
-			} `json:"lines"`
+		Data struct {
+			Items []struct {
+				CartID   string `json:"cartId"`
+				CartName string `json:"cartName"`
+				Status   string `json:"status"`
+				Lines    []struct {
+					ItemID         string `json:"itemId"`
+					Quantity       int64  `json:"quantity"`
+					DiscountAmount int64  `json:"discountAmount"`
+					Available      bool   `json:"available"`
+					Product        struct {
+						Name          string `json:"name"`
+						Barcode       string `json:"barcode"`
+						Price         int64  `json:"price"`
+						StockQuantity int64  `json:"stockQuantity"`
+					} `json:"product"`
+				} `json:"lines"`
+			} `json:"items"`
+			HasMore    bool   `json:"hasMore"`
+			NextCursor string `json:"nextCursor"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(body, &response); err != nil {
 		t.Fatalf("decode list: %s (%v)", body, err)
 	}
-	if len(response.Data) != 2 {
-		t.Fatalf("unexpected visible carts: %+v", response.Data)
+	if len(response.Data.Items) != 2 || response.Data.HasMore || response.Data.NextCursor != "" {
+		t.Fatalf("unexpected visible carts/page: %+v", response.Data)
 	}
 	var held, ownedClaim *struct {
 		CartID   string `json:"cartId"`
@@ -115,8 +119,8 @@ func TestPOSHeldCartListIsScopedAndExposesOnlyHeldCartSnapshot(t *testing.T) {
 			} `json:"product"`
 		} `json:"lines"`
 	}
-	for i := range response.Data {
-		cart := &response.Data[i]
+	for i := range response.Data.Items {
+		cart := &response.Data.Items[i]
 		if cart.CartID == listedID {
 			held = cart
 		}
@@ -351,18 +355,22 @@ func TestPOSHeldCartListPrioritizesOwnedRecoveryRows(t *testing.T) {
 		t.Fatalf("list: %d %s", list.Code, list.Body.String())
 	}
 	var response struct {
-		Data []struct {
-			CartID string `json:"cartId"`
-			Status string `json:"status"`
+		Data struct {
+			Items []struct {
+				CartID string `json:"cartId"`
+				Status string `json:"status"`
+			} `json:"items"`
+			HasMore    bool   `json:"hasMore"`
+			NextCursor string `json:"nextCursor"`
 		} `json:"data"`
 	}
 	if err := json.Unmarshal(list.Body.Bytes(), &response); err != nil {
 		t.Fatal(err)
 	}
-	if len(response.Data) != 100 {
-		t.Fatalf("expected bounded 100 cart list, got %d", len(response.Data))
+	if len(response.Data.Items) != 50 || !response.Data.HasMore || response.Data.NextCursor == "" {
+		t.Fatalf("expected bounded first page with cursor, got %+v", response.Data)
 	}
-	for _, cart := range response.Data {
+	for _, cart := range response.Data.Items {
 		if cart.CartID == held.Data.CartID && cart.Status == "retrieved" {
 			return
 		}
@@ -441,5 +449,132 @@ func TestPOSClaimedCartDiscardIsOwnerOnlyIdempotentAndHasNoSaleEffects(t *testin
 	list := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift, nil, front...)
 	if list.Code != http.StatusOK || strings.Contains(list.Body.String(), held.Data.CartID) {
 		t.Fatalf("cancelled cart remained visible: %d %s", list.Code, list.Body.String())
+	}
+}
+
+func TestPOSHeldCartListPaginatesAllOwnedAndSharedRowsAndSupportsTargetRead(t *testing.T) {
+	a := appForTest(t)
+	space := token()
+	front := loginSite(t, a, "front@suite.test", space, "pos")
+	admin := loginSite(t, a, "admin@suite.test", space, "pos")
+	foreign := loginSite(t, a, "admin@suite.test", token(), "pos")
+	org := "org_test_" + space
+	var shift, store, cashier string
+	if err := a.db.QueryRow(`SELECT id,store_id,cashier_id FROM pos_shifts WHERE organization_id=? AND cashier_id=(SELECT user_id FROM station_accounts WHERE organization_id=? AND email='front@suite.test') AND status='open' LIMIT 1`, org, org).Scan(&shift, &store, &cashier); err != nil {
+		t.Fatal(err)
+	}
+	var item string
+	if err := a.db.QueryRow(`SELECT id FROM pos_catalog_items WHERE organization_id=? AND is_active=1 ORDER BY id LIMIT 1`, org).Scan(&item); err != nil {
+		t.Fatal(err)
+	}
+	const ownedCount, heldCount = 117, 137
+	for i := 0; i < ownedCount; i++ {
+		id := fmt.Sprintf("owned-page-%03d", i)
+		heldAt := fmt.Sprintf("2030-01-%02dT00:00:%02dZ", i/60+1, i%60)
+		if _, err := a.db.Exec(`INSERT INTO pos_held_carts(id,organization_id,store_id,cart_name,items_json,status,locked_by,held_at) VALUES(?,?,?,?,?,'retrieved',?,?)`, id, org, store, id, `[{"itemId":"`+item+`","quantity":1}]`, cashier, heldAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < heldCount; i++ {
+		id := fmt.Sprintf("shared-page-%03d", i)
+		heldAt := fmt.Sprintf("2029-01-%02dT00:00:%02dZ", i/60+1, i%60)
+		if _, err := a.db.Exec(`INSERT INTO pos_held_carts(id,organization_id,store_id,cart_name,items_json,status,held_at) VALUES(?,?,?,?,?,'held',?)`, id, org, store, id, `[{"itemId":"`+item+`","quantity":1}]`, heldAt); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	type pageEnvelope struct {
+		Data struct {
+			Items []struct {
+				CartID string `json:"cartId"`
+				Status string `json:"status"`
+			} `json:"items"`
+			HasMore    bool   `json:"hasMore"`
+			NextCursor string `json:"nextCursor"`
+		} `json:"data"`
+	}
+	cursor := ""
+	seen := make(map[string]string)
+	seenHeld := false
+	firstCursor := ""
+	for pageNumber := 0; pageNumber < 10; pageNumber++ {
+		path := "/api/stations/pos/held-carts?shiftId=" + shift + "&limit=50"
+		if cursor != "" {
+			path += "&cursor=" + cursor
+		}
+		response := request(a, http.MethodGet, path, nil, front...)
+		if response.Code != http.StatusOK {
+			t.Fatalf("page %d: %d %s", pageNumber, response.Code, response.Body.String())
+		}
+		var page pageEnvelope
+		if err := json.Unmarshal(response.Body.Bytes(), &page); err != nil {
+			t.Fatalf("decode page %d: %v", pageNumber, err)
+		}
+		if len(page.Data.Items) == 0 || len(page.Data.Items) > 50 {
+			t.Fatalf("page %d size=%d", pageNumber, len(page.Data.Items))
+		}
+		for _, cart := range page.Data.Items {
+			if cart.Status == "held" {
+				seenHeld = true
+			}
+			if cart.Status == "retrieved" && seenHeld {
+				t.Fatalf("owned retrieved rows must precede held rows")
+			}
+			if _, duplicate := seen[cart.CartID]; duplicate {
+				t.Fatalf("duplicate row across pages: %s", cart.CartID)
+			}
+			seen[cart.CartID] = cart.Status
+		}
+		if page.Data.HasMore != (page.Data.NextCursor != "") {
+			t.Fatalf("page %d inconsistent continuation: %+v", pageNumber, page.Data)
+		}
+		if !page.Data.HasMore {
+			break
+		}
+		if page.Data.NextCursor == cursor {
+			t.Fatalf("page %d repeated cursor", pageNumber)
+		}
+		if firstCursor == "" {
+			firstCursor = page.Data.NextCursor
+		}
+		cursor = page.Data.NextCursor
+	}
+	if len(seen) != ownedCount+heldCount {
+		t.Fatalf("pagination exposed %d/%d scoped rows", len(seen), ownedCount+heldCount)
+	}
+	for i := 0; i < ownedCount; i++ {
+		if seen[fmt.Sprintf("owned-page-%03d", i)] != "retrieved" {
+			t.Fatalf("missing owned retrieved cart %d", i)
+		}
+	}
+	for i := 0; i < heldCount; i++ {
+		if seen[fmt.Sprintf("shared-page-%03d", i)] != "held" {
+			t.Fatalf("missing shared held cart %d", i)
+		}
+	}
+
+	target := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&cartId=owned-page-116", nil, front...)
+	if target.Code != http.StatusOK || !strings.Contains(target.Body.String(), `"cartId":"owned-page-116"`) || strings.Contains(target.Body.String(), `"cartId":"owned-page-115"`) {
+		t.Fatalf("owner target read failed: %d %s", target.Code, target.Body.String())
+	}
+	foreignTarget := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&cartId=owned-page-116", nil, foreign...)
+	if foreignTarget.Code != http.StatusNotFound || strings.Contains(foreignTarget.Body.String(), "owned-page-116") {
+		t.Fatalf("foreign target read disclosed cart: %d %s", foreignTarget.Code, foreignTarget.Body.String())
+	}
+	otherCashierTarget := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&cartId=owned-page-116", nil, admin...)
+	if otherCashierTarget.Code != http.StatusOK || strings.Contains(otherCashierTarget.Body.String(), "owned-page-116") {
+		t.Fatalf("same-org other cashier should not read the claim: %d %s", otherCashierTarget.Code, otherCashierTarget.Body.String())
+	}
+	wrongUserCursor := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&cursor="+firstCursor, nil, admin...)
+	if wrongUserCursor.Code != http.StatusBadRequest {
+		t.Fatalf("cursor must be bound to caller: %d %s", wrongUserCursor.Code, wrongUserCursor.Body.String())
+	}
+	malformedCursor := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&cursor=not-a-cursor", nil, front...)
+	if malformedCursor.Code != http.StatusBadRequest {
+		t.Fatalf("malformed cursor expected 400: %d %s", malformedCursor.Code, malformedCursor.Body.String())
+	}
+	badLimit := request(a, http.MethodGet, "/api/stations/pos/held-carts?shiftId="+shift+"&limit=500", nil, front...)
+	if badLimit.Code != http.StatusBadRequest {
+		t.Fatalf("oversized page limit should be rejected: %d %s", badLimit.Code, badLimit.Body.String())
 	}
 }
