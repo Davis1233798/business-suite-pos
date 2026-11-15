@@ -7,6 +7,7 @@ The Go API remains authoritative for product state, prices, shift ownership, cas
 ## Boundary and failure behavior
 
 - The terminal read returns active registers for the current organization and only open shifts owned by the current user. It does not expose another cashier's open shift or back-office dataset.
+- The cashier shell preserves existing role-gated navigation: back-office-scoped accounts retain operations and print-center links, administrators retain account/permission management, and front-office-only accounts do not see those links.
 - Product lookup resolves an active barcode and current stock/price from Go. Repeated scans increment that item in the in-memory basket.
 - Opening a shift and checkout retain the existing Go permission checks. Checkout accepts item IDs, quantities, and line discounts; Go re-reads product details and stock inside its transaction.
 - The basket displays listed-price subtotal, per-line fixed-amount discounts, net due, cash tender, and estimated change. Discount values are submitted as `discountAmount`; Go validates them against its current server-side price. There are no campaign rules or manager approval in this slice.

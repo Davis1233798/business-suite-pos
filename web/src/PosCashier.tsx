@@ -14,7 +14,7 @@ class ApiError extends Error {
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: 'same-origin', ...init });
-  const envelope = await response.json();
+  const envelope = await response.json() as { success?: boolean; error?: { message?: string }; data?: T };
   if (!response.ok || !envelope.success) throw new ApiError(envelope.error?.message || `HTTP ${response.status}`, response.status);
   return envelope.data as T;
 }

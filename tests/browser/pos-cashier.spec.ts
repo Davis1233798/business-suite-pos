@@ -3,10 +3,10 @@ import { test, expect } from '@playwright/test';
 const register = { id: 'register-a', name: 'Register A', storeId: 'store-a' };
 const product = { id: 'item-coffee', name: 'Cold brew coffee', barcode: '4710001001', price: 100, stockQuantity: 100 };
 
-async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' = 'operator') {
+async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' | 'admin' = 'operator', scope: 'front' | 'back' = 'front') {
   await page.route('**/api/auth/me?site=pos', route => route.fulfill({ json: { success: true, data: {
     userId: 'cashier-a', organizationId: 'org-a', name: 'Cashier A', email: 'cashier@example.test',
-    grants: [{ site: 'pos', role, scope: 'front', enabled: true }],
+    grants: [{ site: 'pos', role, scope, enabled: true }],
   } } }));
   await page.route('**/api/stations/pos/data?view=front', route => route.fulfill({ json: { success: true, data: {
     catalogItems: [], sales: [],
@@ -47,6 +47,9 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   });
 
   await cashier(page);
+  await expect(page.getByRole('link', { name: 'Back office' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Labels and documents' })).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Users and permissions' })).toHaveCount(0);
   await page.getByLabel('Register').selectOption(register.id);
   await page.getByLabel('Opening cash').fill('1000');
   await page.getByRole('button', { name: 'Open shift' }).click();
@@ -94,6 +97,24 @@ test('read-only POS identity cannot open a shift or submit a sale', async ({ pag
   await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeDisabled();
   await expect(page.getByLabel('Opening cash')).toBeDisabled();
   await expect(page.getByLabel('Cash tendered')).toBeDisabled();
+});
+
+test('authorized back-office accounts keep POS operations and print navigation from cashier', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [], openShifts: [] } } }));
+  await cashier(page, 'operator', 'back');
+  await expect(page.getByRole('link', { name: 'Back office' })).toHaveAttribute('href', '/pos/back');
+  await expect(page.getByRole('link', { name: 'Labels and documents' })).toHaveAttribute('href', '/pos/print');
+  await expect(page.getByRole('link', { name: 'Users and permissions' })).toHaveCount(0);
+
+  await page.unroute('**/api/auth/me?site=pos');
+  await page.route('**/api/auth/me?site=pos', route => route.fulfill({ json: { success: true, data: {
+    userId: 'admin-a', organizationId: 'org-a', name: 'Admin', email: 'admin@example.test',
+    grants: [{ site: 'pos', role: 'admin', scope: 'back', enabled: true }],
+  } } }));
+  await page.reload();
+  await expect(page.getByRole('link', { name: 'Back office' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Labels and documents' })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Users and permissions' })).toHaveAttribute('href', '/pos/users');
 });
 
 test('receipt shows server-final values when the catalog price changes after barcode lookup', async ({ page }) => {
