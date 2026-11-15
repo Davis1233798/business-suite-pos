@@ -991,7 +991,7 @@ test('stale refund quantity rejection refreshes the exact receipt before another
   let postCount = 0;
   await page.route('**/api/stations/pos/business', async route => {
     postCount += 1;
-    await route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry' } } });
+    await route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry', outcome: 'not_applied' } } });
   });
   await posBackOffice(page);
   await page.getByLabel('Receipt number').fill('POS-REFUND-001');
@@ -1037,7 +1037,7 @@ test('rejected refund with unavailable receipt refresh stays clearly rejected', 
     if (lookupCount > 1) return route.fulfill({ status: 503, json: { success: false, error: { message: 'Lookup unavailable' } } });
     return route.fulfill({ json: { success: true, data: refundSale } });
   });
-  await page.route('**/api/stations/pos/business', route => route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry' } } }));
+  await page.route('**/api/stations/pos/business', route => route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry', outcome: 'not_applied' } } }));
   await posBackOffice(page);
   await page.getByLabel('Receipt number').fill('POS-REFUND-001');
   await page.getByRole('button', { name: 'Find receipt' }).click();
@@ -1051,7 +1051,7 @@ test('rejected refund with unavailable receipt refresh stays clearly rejected', 
 test('ambiguous refund keeps its idempotency key across pre-handler errors and reload', async ({ page }) => {
   await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
   const refundRequests: Record<string, any>[] = [];
-  const retryStatuses = [503, 401, 429, 403];
+  const retryStatuses = [503, 401, 429, 403, 400, 409];
   await page.route('**/api/stations/pos/business', async route => {
     refundRequests.push(route.request().postDataJSON());
     if (refundRequests.length <= retryStatuses.length) {
@@ -1078,8 +1078,90 @@ test('ambiguous refund keeps its idempotency key across pre-handler errors and r
     expect(retryStatuses[refundRequests.length - 1]).toBe(expectedStatus);
   }
   await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Resolve the access or request issue');
+  expect(retryStatuses[refundRequests.length - 1]).toBe(400);
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Refund retry key conflicts with a different request');
+  expect(retryStatuses[refundRequests.length - 1]).toBe(409);
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
   await expect(page.getByRole('status').filter({ hasText: 'REF-AUTH-RECOVERED' })).toBeVisible();
-  expect(refundRequests).toHaveLength(5);
+  expect(refundRequests).toHaveLength(7);
   expect(refundRequests.every(request => request.idempotencyKey === refundRequests[0].idempotencyKey)).toBe(true);
   expect(refundRequests.every(request => JSON.stringify(request) === JSON.stringify(refundRequests[0]))).toBe(true);
+});
+
+test('refund editor enforces the backend quantity and UTF-8 reason limits before saving', async ({ page }) => {
+  const sale = { ...refundSale, lines: [{ ...refundSale.lines[0], quantity: 1500, remainingQuantity: 1500 }] };
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: sale } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', route => { requests.push(route.request().postDataJSON()); return route.fulfill({ status: 500, json: { success: false, error: { message: 'Should not submit invalid values' } } }); });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  const quantity = page.getByLabel('Refund quantity');
+  await expect(quantity).toHaveAttribute('max', '1000');
+  await quantity.fill('1001');
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeDisabled();
+  await quantity.fill('1000');
+  await page.getByLabel('Refund reason').fill('中'.repeat(67));
+  await expect(page.getByText('Refund reason must be 200 UTF-8 bytes or fewer.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeDisabled();
+  await page.getByLabel('Refund reason').fill('中'.repeat(66));
+  await expect(page.getByText('Refund reason must be 200 UTF-8 bytes or fewer.')).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeEnabled();
+  expect(requests).toHaveLength(0);
+  expect(await page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith('pos-refund-pending:')))).toEqual([]);
+});
+
+test('definitive no-effect validation clears an older impossible refund and restores an editable form', async ({ page }) => {
+  const ownerKey = 'org-a:manager-a';
+  const attempt = { receiptNumber: 'POS-REFUND-001', saleLineId: 'line-a', quantity: 1001, reason: 'Customer return', idempotencyKey: 'refund-old-invalid-0001' };
+  await page.addInitScript(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), { key: `pos-refund-pending:${encodeURIComponent(ownerKey)}`, value: attempt });
+  const sale = { ...refundSale, lines: [{ ...refundSale.lines[0], quantity: 1500, remainingQuantity: 1500 }] };
+  let lookups = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', route => { lookups++; return route.fulfill({ json: { success: true, data: sale } }); });
+  let sent: Record<string, any> | undefined;
+  await page.route('**/api/stations/pos/business', route => {
+    sent = route.request().postDataJSON();
+    return route.fulfill({ status: 400, json: { success: false, error: { message: 'Invalid refund quantity', outcome: 'not_applied' } } });
+  });
+  await posBackOffice(page);
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Refund request was rejected before processing');
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toHaveCount(0);
+  await expect(page.getByLabel('Refund quantity')).toHaveValue('1000');
+  await expect(page.getByLabel('Refund reason')).toHaveValue('Customer return');
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeEnabled();
+  expect(sent).toMatchObject({ saleLineId: 'line-a', quantity: 1001, idempotencyKey: attempt.idempotencyKey });
+  expect(lookups).toBe(2);
+  expect(await page.evaluate(key => sessionStorage.getItem(key), `pos-refund-pending:${encodeURIComponent(ownerKey)}`)).toBeNull();
+});
+
+test('definitive no-effect validation releases a persisted UTF-8-overlong reason for correction', async ({ page }) => {
+  const ownerKey = 'org-a:manager-a';
+  const longReason = '中'.repeat(67);
+  const attempt = { receiptNumber: 'POS-REFUND-001', saleLineId: 'line-a', quantity: 1, reason: longReason, idempotencyKey: 'refund-old-long-reason-01' };
+  await page.addInitScript(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), { key: `pos-refund-pending:${encodeURIComponent(ownerKey)}`, value: attempt });
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
+  let sent: Record<string, any> | undefined;
+  await page.route('**/api/stations/pos/business', route => {
+    sent = route.request().postDataJSON();
+    return route.fulfill({ status: 400, json: { success: false, error: { message: 'Invalid point-of-sale request', outcome: 'not_applied' } } });
+  });
+  await posBackOffice(page);
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Refund request was rejected before processing');
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toHaveCount(0);
+  const reason = page.getByLabel('Refund reason');
+  await expect(reason).toHaveValue(longReason);
+  await expect(page.getByText('Refund reason must be 200 UTF-8 bytes or fewer.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeDisabled();
+  await reason.fill('中'.repeat(66));
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeEnabled();
+  expect(sent).toMatchObject({ saleLineId: 'line-a', quantity: 1, reason: longReason, idempotencyKey: attempt.idempotencyKey });
+  expect(await page.evaluate(key => sessionStorage.getItem(key), `pos-refund-pending:${encodeURIComponent(ownerKey)}`)).toBeNull();
 });

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -11,13 +12,20 @@ import (
 
 type posRefundFixture struct {
 	a                                                               *App
+	dbPath                                                          string
 	org, shift, store, register, cashier, item, sale, line, receipt string
 	admin, front, office, viewer, foreign                           []*http.Cookie
 }
 
 func newPOSRefundFixture(t *testing.T, paymentMethod string) posRefundFixture {
 	t.Helper()
-	a := appForTest(t)
+	dbPath := filepath.Join(t.TempDir(), "refund.sqlite")
+	db, err := openDB(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	a := &App{db: db}
 	space := token()
 	org := "org_test_" + space
 	admin := loginSite(t, a, "admin@suite.test", space, "pos")
@@ -44,7 +52,7 @@ func newPOSRefundFixture(t *testing.T, paymentMethod string) posRefundFixture {
 	if _, err := a.db.Exec(`INSERT INTO pos_sale_lines(id,organization_id,sale_id,item_id,barcode,name,unit_price,quantity,discount_amount,line_total,refunded_quantity) VALUES(?,?,?,?,?,?,?,?,?,?,0)`, line, org, sale, item, "REFUND-ITEM", "Refund fixture item", 34, 3, 1, 101); err != nil {
 		t.Fatal(err)
 	}
-	return posRefundFixture{a: a, org: org, shift: shift, store: store, register: register, cashier: cashier, item: item, sale: sale, line: line, receipt: receipt,
+	return posRefundFixture{a: a, dbPath: dbPath, org: org, shift: shift, store: store, register: register, cashier: cashier, item: item, sale: sale, line: line, receipt: receipt,
 		admin: admin, front: front, office: office, viewer: viewer, foreign: foreign}
 }
 
@@ -273,6 +281,205 @@ func TestPOSRefundCumulativeAllocationAndIdempotentReplay(t *testing.T) {
 	}
 }
 
+func TestPOSRefundValidationDeclaresNoEffectForUnsupportedQuantityAndUTF8Reason(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		quantity int
+		reason   string
+	}{
+		{name: "quantity above endpoint maximum", quantity: 1001, reason: "valid reason"},
+		{name: "reason above UTF-8 byte maximum", quantity: 1, reason: strings.Repeat("中", 67)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPOSRefundFixture(t, "cash")
+			key := "refund-too-many-0001"
+			if tc.quantity == 1 {
+				key = "refund-long-reason-01"
+			}
+			input := refundInput(f.line, tc.quantity, tc.reason, key)
+			w := request(f.a, http.MethodPost, "/api/stations/pos/business", input, f.admin...)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("invalid refund request expected 400: %d %s", w.Code, w.Body.String())
+			}
+			var response struct {
+				Error struct {
+					Outcome string `json:"outcome"`
+				} `json:"error"`
+			}
+			if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+				t.Fatalf("decode validation response: %v %s", err, w.Body.String())
+			}
+			if response.Error.Outcome != "not_applied" {
+				t.Fatalf("validation failure must explicitly prove no effect: %s", w.Body.String())
+			}
+			replay := request(f.a, http.MethodPost, "/api/stations/pos/business", input, f.admin...)
+			if replay.Code != w.Code || replay.Body.String() != w.Body.String() {
+				t.Fatalf("same invalid key must replay its terminal rejection: %d %s; original %s", replay.Code, replay.Body.String(), w.Body.String())
+			}
+			corrected := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1, "corrected request", key), f.admin...)
+			if corrected.Code != http.StatusConflict || strings.Contains(corrected.Body.String(), `"outcome":"not_applied"`) {
+				t.Fatalf("different payload must not reuse terminally rejected key: %d %s", corrected.Code, corrected.Body.String())
+			}
+			var refunded, stock, refunds, idempotency int64
+			if err := f.a.db.QueryRow(`SELECT refunded_quantity FROM pos_sale_lines WHERE organization_id=? AND id=?`, f.org, f.line).Scan(&refunded); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.a.db.QueryRow(`SELECT stock_quantity FROM pos_catalog_items WHERE organization_id=? AND id=?`, f.org, f.item).Scan(&stock); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.a.db.QueryRow(`SELECT count(*) FROM pos_refunds WHERE organization_id=?`, f.org).Scan(&refunds); err != nil {
+				t.Fatal(err)
+			}
+			if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND endpoint='/station/pos/refund'`, f.org).Scan(&idempotency); err != nil {
+				t.Fatal(err)
+			}
+			if refunded != 0 || stock != 10 || refunds != 0 || idempotency != 1 {
+				t.Fatalf("invalid refund mutated state refunded=%d stock=%d refunds=%d idempotency=%d", refunded, stock, refunds, idempotency)
+			}
+		})
+	}
+}
+
+func TestPOSRefundValidationDoesNotOverrideAnExistingIdempotencyKey(t *testing.T) {
+	f := newPOSRefundFixture(t, "cash")
+	key := "refund-key-used-0001"
+	first := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1, "valid refund", key), f.admin...)
+	if first.Code != http.StatusOK {
+		t.Fatalf("initial refund: %d %s", first.Code, first.Body.String())
+	}
+	invalid := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1001, "valid reason", key), f.admin...)
+	if invalid.Code != http.StatusConflict {
+		t.Fatalf("existing key with a changed invalid payload must conflict before validation: %d %s", invalid.Code, invalid.Body.String())
+	}
+	if strings.Contains(invalid.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("conflicting key must not claim the earlier operation had no effect: %s", invalid.Body.String())
+	}
+	replay := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1, "valid refund", key), f.admin...)
+	if replay.Code != http.StatusOK || replay.Body.String() != first.Body.String() {
+		t.Fatalf("same-key replay must still resolve to the committed result: %d %s; original %s", replay.Code, replay.Body.String(), first.Body.String())
+	}
+	var refunded, stock, refunds, idempotency int64
+	if err := f.a.db.QueryRow(`SELECT refunded_quantity FROM pos_sale_lines WHERE organization_id=? AND id=?`, f.org, f.line).Scan(&refunded); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT stock_quantity FROM pos_catalog_items WHERE organization_id=? AND id=?`, f.org, f.item).Scan(&stock); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM pos_refunds WHERE organization_id=? AND original_sale_id=?`, f.org, f.sale).Scan(&refunds); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND key=? AND endpoint='/station/pos/refund'`, f.org, key).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if refunded != 1 || stock != 11 || refunds != 1 || idempotency != 1 {
+		t.Fatalf("conflicting invalid retry changed committed state refunded=%d stock=%d refunds=%d idempotency=%d", refunded, stock, refunds, idempotency)
+	}
+}
+
+func TestPOSRefundMissingLineReservesTerminalNoEffectOutcome(t *testing.T) {
+	f := newPOSRefundFixture(t, "cash")
+	key := "refund-missing-line-0001"
+	input := refundInput("deleted-sale-line", 1, "return", key)
+	w := request(f.a, http.MethodPost, "/api/stations/pos/business", input, f.admin...)
+	if w.Code != http.StatusNotFound || !strings.Contains(w.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("missing line must explicitly report a terminal no-effect result: %d %s", w.Code, w.Body.String())
+	}
+	replay := request(f.a, http.MethodPost, "/api/stations/pos/business", input, f.admin...)
+	if replay.Code != w.Code || replay.Body.String() != w.Body.String() {
+		t.Fatalf("missing-line result must replay exactly: %d %s; original %s", replay.Code, replay.Body.String(), w.Body.String())
+	}
+	changed := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1, "return", key), f.admin...)
+	if changed.Code != http.StatusConflict || strings.Contains(changed.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("changed request must conflict with the reserved missing-line key: %d %s", changed.Code, changed.Body.String())
+	}
+	var stock, refunded, refunds, idempotency int64
+	if err := f.a.db.QueryRow(`SELECT stock_quantity FROM pos_catalog_items WHERE organization_id=? AND id=?`, f.org, f.item).Scan(&stock); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT refunded_quantity FROM pos_sale_lines WHERE organization_id=? AND id=?`, f.org, f.line).Scan(&refunded); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM pos_refunds WHERE organization_id=? AND original_sale_id=?`, f.org, f.sale).Scan(&refunds); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND endpoint='/station/pos/refund' AND key=?`, f.org, key).Scan(&idempotency); err != nil {
+		t.Fatal(err)
+	}
+	if stock != 10 || refunded != 0 || refunds != 0 || idempotency != 1 {
+		t.Fatalf("missing-line rejection side effects stock=%d refunded=%d refunds=%d idempotency=%d", stock, refunded, refunds, idempotency)
+	}
+}
+
+func TestPOSRefundInvalidAndValidSameKeyAcrossDBHandlesReserveOnlyOneOutcome(t *testing.T) {
+	f := newPOSRefundFixture(t, "cash")
+	otherDB, err := openDB(f.dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer otherDB.Close()
+	other := &App{db: otherDB}
+	key := "refund-racing-key-0001"
+	invalidInput := refundInput(f.line, 1001, "invalid quantity", key)
+	validInput := refundInput(f.line, 1, "valid quantity", key)
+	type response struct {
+		code int
+		body string
+	}
+	results := make(chan response, 2)
+	start := make(chan struct{})
+	go func() {
+		<-start
+		w := request(f.a, http.MethodPost, "/api/stations/pos/business", invalidInput, f.admin...)
+		results <- response{w.Code, w.Body.String()}
+	}()
+	go func() {
+		<-start
+		w := request(other, http.MethodPost, "/api/stations/pos/business", validInput, f.admin...)
+		results <- response{w.Code, w.Body.String()}
+	}()
+	close(start)
+	first, second := <-results, <-results
+	if first.code == http.StatusBadRequest && second.code == http.StatusOK || first.code == http.StatusOK && second.code == http.StatusBadRequest {
+		t.Fatalf("concurrent different payloads both claimed an outcome for one key: first=%d %s second=%d %s", first.code, first.body, second.code, second.body)
+	}
+	if first.code == http.StatusServiceUnavailable || second.code == http.StatusServiceUnavailable {
+		// Retry the transient lock loser after the winning transaction has committed.
+		if first.code == http.StatusServiceUnavailable {
+			w := request(f.a, http.MethodPost, "/api/stations/pos/business", invalidInput, f.admin...)
+			first = response{w.Code, w.Body.String()}
+		}
+		if second.code == http.StatusServiceUnavailable {
+			w := request(other, http.MethodPost, "/api/stations/pos/business", validInput, f.admin...)
+			second = response{w.Code, w.Body.String()}
+		}
+	}
+	if first.code != http.StatusBadRequest && first.code != http.StatusConflict && first.code != http.StatusOK || second.code != http.StatusBadRequest && second.code != http.StatusConflict && second.code != http.StatusOK {
+		t.Fatalf("unexpected concurrent/retry responses: first=%d %s second=%d %s", first.code, first.body, second.code, second.body)
+	}
+	if first.code == http.StatusBadRequest && second.code == http.StatusOK || first.code == http.StatusOK && second.code == http.StatusBadRequest {
+		t.Fatalf("same key was both terminally rejected and committed: first=%d %s second=%d %s", first.code, first.body, second.code, second.body)
+	}
+	terminalRejected := first.code == http.StatusBadRequest || second.code == http.StatusBadRequest
+	for _, result := range []response{first, second} {
+		if result.code == http.StatusBadRequest && !strings.Contains(result.body, `"outcome":"not_applied"`) {
+			t.Fatalf("terminal validation rejection must include its no-effect marker: %s", result.body)
+		}
+	}
+	var idem, refunds, refunded int
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND endpoint='/station/pos/refund' AND key=?`, f.org, key).Scan(&idem); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT count(*) FROM pos_refunds WHERE organization_id=? AND original_sale_id=?`, f.org, f.sale).Scan(&refunds); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.a.db.QueryRow(`SELECT refunded_quantity FROM pos_sale_lines WHERE organization_id=? AND id=?`, f.org, f.line).Scan(&refunded); err != nil {
+		t.Fatal(err)
+	}
+	if idem != 1 || refunds > 1 || refunded > 1 || (terminalRejected && (refunds != 0 || refunded != 0)) {
+		t.Fatalf("key reservation effects idem=%d refunds=%d refunded=%d responses=%d/%d", idem, refunds, refunded, first.code, second.code)
+	}
+}
+
 func TestPOSRefundRejectsClosedOriginalShiftAndNonCashWithoutMutation(t *testing.T) {
 	for _, tc := range []struct{ name, paymentMethod, closeShift string }{
 		{name: "closed shift", paymentMethod: "cash", closeShift: "closed"},
@@ -288,6 +495,9 @@ func TestPOSRefundRejectsClosedOriginalShiftAndNonCashWithoutMutation(t *testing
 			w := request(f.a, http.MethodPost, "/api/stations/pos/business", refundInput(f.line, 1, "return", "refund-ineligible-01"), f.admin...)
 			if w.Code != http.StatusConflict {
 				t.Fatalf("ineligible sale expected 409: %d %s", w.Code, w.Body.String())
+			}
+			if !strings.Contains(w.Body.String(), `"outcome":"not_applied"`) {
+				t.Fatalf("refund conflict must explicitly report no effect: %s", w.Body.String())
 			}
 			var refunded, stock, refunds, refundLines, audits, idempotency int64
 			if err := f.a.db.QueryRow(`SELECT refunded_quantity FROM pos_sale_lines WHERE organization_id=? AND id=?`, f.org, f.line).Scan(&refunded); err != nil {
@@ -308,7 +518,7 @@ func TestPOSRefundRejectsClosedOriginalShiftAndNonCashWithoutMutation(t *testing
 			if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND endpoint='/station/pos/refund'`, f.org).Scan(&idempotency); err != nil {
 				t.Fatal(err)
 			}
-			if refunded != 0 || stock != 10 || refunds != 0 || refundLines != 0 || audits != 0 || idempotency != 0 {
+			if refunded != 0 || stock != 10 || refunds != 0 || refundLines != 0 || audits != 0 || idempotency != 1 {
 				t.Fatalf("ineligible request mutated state refunded=%d stock=%d refund=%d lines=%d audit=%d idem=%d", refunded, stock, refunds, refundLines, audits, idempotency)
 			}
 		})
@@ -387,7 +597,7 @@ func TestPOSRefundMissingProductRollsBackRefundState(t *testing.T) {
 	if err := f.a.db.QueryRow(`SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND key='refund-missing-item-01'`, f.org).Scan(&idempotency); err != nil {
 		t.Fatal(err)
 	}
-	if refunded != 0 || refunds != 0 || refundLines != 0 || audits != 0 || idempotency != 0 {
-		t.Fatalf("failed refund partially committed refunded=%d refunds=%d lines=%d audit=%d idem=%d", refunded, refunds, refundLines, audits, idempotency)
+	if refunded != 0 || refunds != 0 || refundLines != 0 || audits != 0 || idempotency != 1 {
+		t.Fatalf("rejected refund effects/reservation refunded=%d refunds=%d lines=%d audit=%d idem=%d", refunded, refunds, refundLines, audits, idempotency)
 	}
 }
