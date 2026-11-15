@@ -3,7 +3,10 @@ import { test, expect } from '@playwright/test';
 const register = { id: 'register-a', name: 'Register A', storeId: 'store-a' };
 const product = { id: 'item-coffee', name: 'Cold brew coffee', barcode: '4710001001', price: 100, stockQuantity: 100 };
 
-async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' | 'admin' = 'operator', scope: 'front' | 'back' = 'front') {
+async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' | 'admin' = 'operator', scope: 'front' | 'back' = 'front', language: 'en' | 'zh-TW' = 'en') {
+  await page.addInitScript(selectedLanguage => {
+    if (!localStorage.getItem('suite-language')) localStorage.setItem('suite-language', selectedLanguage);
+  }, language);
   await page.route('**/api/auth/me?site=pos', route => route.fulfill({ json: { success: true, data: {
     userId: 'cashier-a', organizationId: 'org-a', name: 'Cashier A', email: 'cashier@example.test',
     grants: [{ site: 'pos', role, scope, enabled: true }],
@@ -12,7 +15,7 @@ async function cashier(page: import('@playwright/test').Page, role: 'operator' |
     catalogItems: [], sales: [],
   } } }));
   await page.goto('/pos/front');
-  await expect(page.getByRole('heading', { name: 'Cashier' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: language === 'zh-TW' ? '收銀' : 'Cashier' })).toBeVisible();
 }
 
 test('cashier opens a shift, scans twice, applies a fixed line discount, and retries checkout with the same key', async ({ page }) => {
@@ -99,6 +102,23 @@ test('read-only POS identity cannot open a shift or submit a sale', async ({ pag
   await expect(page.getByLabel('Cash tendered')).toBeDisabled();
 });
 
+test('cashier follows the selected Traditional Chinese language', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [], openShifts: [] } } }));
+  await cashier(page, 'operator', 'front', 'zh-TW');
+  await expect(page.getByRole('heading', { name: '開班' })).toBeVisible();
+  await expect(page.getByLabel('收銀機')).toBeVisible();
+  await expect(page.getByLabel('開班現金')).toBeVisible();
+  await expect(page.getByLabel('掃描條碼')).toBeVisible();
+  await expect(page.getByRole('heading', { name: '產品' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '現金收款' })).toBeVisible();
+  await expect(page.getByLabel('收款金額')).toBeVisible();
+
+  await page.evaluate(() => localStorage.setItem('suite-language', 'en'));
+  await page.reload();
+  await expect(page.getByRole('heading', { name: 'Cashier' })).toBeVisible();
+  await expect(page.getByLabel('Scan barcode')).toBeVisible();
+});
+
 test('authorized back-office accounts keep POS operations and print navigation from cashier', async ({ page }) => {
   await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [], openShifts: [] } } }));
   await cashier(page, 'operator', 'back');
@@ -139,7 +159,7 @@ test('receipt shows server-final values when the catalog price changes after bar
   const receipt = page.locator('.pos-receipt');
   await expect(receipt).toContainText('Subtotal $220');
   await expect(receipt).toContainText('Discount -$10');
-  await expect(receipt).toContainText('Total $210');
-  await expect(receipt).toContainText('Change $10');
+  await expect(receipt).toContainText('Total due $210');
+  await expect(receipt).toContainText('Cash change $10');
   await expect(receipt).toContainText('Receipt amounts are calculated by the POS server.');
 });

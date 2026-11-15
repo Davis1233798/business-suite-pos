@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { tr } from './locale';
 import './pos-cashier.css';
 
 type Register = { id: string; name: string; storeId: string };
@@ -15,7 +16,7 @@ class ApiError extends Error {
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: 'same-origin', ...init });
   const envelope = await response.json() as { success?: boolean; error?: { message?: string }; data?: T };
-  if (!response.ok || !envelope.success) throw new ApiError(envelope.error?.message || `HTTP ${response.status}`, response.status);
+  if (!response.ok || !envelope.success) throw new ApiError(tr(envelope.error?.message || `HTTP ${response.status}`), response.status);
   return envelope.data as T;
 }
 
@@ -82,17 +83,17 @@ export function PosCashier({ role }: { role: string }) {
       openShiftKey.current = '';
       setOpenShiftUncertain(false);
       setActiveShiftId(result.shiftId);
-      setMessage('Shift open');
+      setMessage(tr('Shift open'));
       const register = terminal?.registers.find(entry => entry.id === registerId);
       if (register) setTerminal(current => current ? {
         ...current,
         openShifts: [...current.openShifts, { id: result.shiftId, registerId, storeId: register.storeId, openingCash: Number(openingCash), openedAt: new Date().toISOString() }],
       } : current);
-      try { await refreshTerminal(); } catch (reason) { setError(`Shift opened; status refresh failed: ${(reason as Error).message}`); }
+      try { await refreshTerminal(); } catch (reason) { setError(`${tr('Shift opened; status refresh failed:')} ${(reason as Error).message}`); }
     } catch (reason) {
       if (!(reason instanceof ApiError) || reason.status >= 500) {
         setOpenShiftUncertain(true);
-        setError('Shift opening outcome is unconfirmed. Retry the same request before changing it.');
+        setError(tr('Shift opening outcome is unconfirmed. Retry the same request before changing it.'));
       } else {
         openShiftKey.current = '';
         setOpenShiftUncertain(false);
@@ -109,7 +110,7 @@ export function PosCashier({ role }: { role: string }) {
     setBusy(true); setError(''); setMessage('');
     try {
       const item = await api<Product>(`/api/stations/pos/barcode?code=${encodeURIComponent(code)}`);
-      if ((basket.find(line => line.item.id === item.id)?.quantity || 0) >= 1000) throw new Error('Maximum quantity per product is 1000.');
+      if ((basket.find(line => line.item.id === item.id)?.quantity || 0) >= 1000) throw new Error(tr('Maximum quantity per product is 1000.'));
       setBasket(current => {
         const existing = current.find(line => line.item.id === item.id);
         if (existing) return current.map(line => line.item.id === item.id
@@ -157,14 +158,14 @@ export function PosCashier({ role }: { role: string }) {
       });
       setReceipt(result); setBasket([]); setTender(''); retryKey.current = '';
       setCheckoutUncertain(false);
-      setMessage('Sale complete');
-      try { await refreshTerminal(); } catch (reason) { setError(`Sale completed; shift status refresh failed: ${(reason as Error).message}`); }
+      setMessage(tr('Sale complete'));
+      try { await refreshTerminal(); } catch (reason) { setError(`${tr('Sale completed; shift status refresh failed:')} ${(reason as Error).message}`); }
       requestAnimationFrame(() => scanInput.current?.focus());
     } catch (reason) {
       // Preserve the exact request after an ambiguous outcome; only replay it.
       if (!(reason instanceof ApiError) || reason.status >= 500) {
         setCheckoutUncertain(true);
-        setError('Checkout outcome is unconfirmed. Retry this exact sale before changing it.');
+        setError(tr('Checkout outcome is unconfirmed. Retry this exact sale before changing it.'));
       } else {
         retryKey.current = '';
         setCheckoutUncertain(false);
@@ -177,54 +178,54 @@ export function PosCashier({ role }: { role: string }) {
 
   return <section className="pos-cashier" aria-labelledby="pos-cashier-heading">
     <header className="pos-cashier-header">
-      <div><p className="eyebrow">COUNTERPOINT / FRONT OFFICE</p><h1 id="pos-cashier-heading">Cashier</h1><p>Scan products, take cash, and issue a receipt.</p></div>
-      <div className="pos-cashier-shift" role="status">{activeShift ? `Shift open · ${activeShift.id}` : 'No open shift'}</div>
+      <div><p className="eyebrow">{tr('COUNTERPOINT / FRONT OFFICE')}</p><h1 id="pos-cashier-heading">{tr('Cashier')}</h1><p>{tr('Scan products, take cash, and issue a receipt.')}</p></div>
+      <div className="pos-cashier-shift" role="status">{activeShift ? `${tr('Shift open')} · ${activeShift.id}` : tr('No open shift')}</div>
     </header>
 
     {error && <p className="pos-cashier-error" role="alert">{error}</p>}
     {message && <p className="pos-cashier-message" role="status">{message}</p>}
 
-    {!activeShift && <section className="pos-cashier-panel pos-shift-open" aria-label="Open a cashier shift">
-      <h2>Open shift</h2>
-      <label>Register<select aria-label="Register" value={registerId} onChange={event => setRegisterId(event.target.value)} disabled={!writable || busy || openShiftUncertain}>
-        {!terminal?.registers.length && <option value="">No active registers</option>}
+    {!activeShift && <section className="pos-cashier-panel pos-shift-open" aria-label={tr('Open a cashier shift')}>
+      <h2>{tr('Open shift')}</h2>
+      <label>{tr('Register')}<select aria-label={tr('Register')} value={registerId} onChange={event => setRegisterId(event.target.value)} disabled={!writable || busy || openShiftUncertain}>
+        {!terminal?.registers.length && <option value="">{tr('No active registers')}</option>}
         {terminal?.registers.map(register => <option key={register.id} value={register.id}>{register.name}</option>)}
       </select></label>
-      <label>Opening cash<input aria-label="Opening cash" inputMode="numeric" type="number" min="0" step="1" value={openingCash} onChange={event => setOpeningCash(event.target.value)} disabled={!writable || busy || openShiftUncertain}/></label>
-      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || !registerId}>{openShiftUncertain ? 'Retry opening shift' : 'Open shift'}</button>
-      {!writable && <p>Read-only access cannot open a shift or complete sales.</p>}
+      <label>{tr('Opening cash')}<input aria-label={tr('Opening cash')} inputMode="numeric" type="number" min="0" step="1" value={openingCash} onChange={event => setOpeningCash(event.target.value)} disabled={!writable || busy || openShiftUncertain}/></label>
+      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || !registerId}>{openShiftUncertain ? tr('Retry opening shift') : tr('Open shift')}</button>
+      {!writable && <p>{tr('Read-only access cannot open a shift or complete sales.')}</p>}
     </section>}
 
     <div className="pos-cashier-grid">
-      <section className="pos-cashier-panel pos-scan-panel" aria-label="Scan products">
-        <h2>Products</h2>
+      <section className="pos-cashier-panel pos-scan-panel" aria-label={tr('Scan products')}>
+        <h2>{tr('Products')}</h2>
         <form onSubmit={event => { event.preventDefault(); void scan(); }}>
-          <label htmlFor="pos-barcode">Scan barcode</label>
-          <div className="pos-scan-row"><input id="pos-barcode" ref={scanInput} value={barcode} onChange={event => setBarcode(event.target.value)} autoComplete="off" disabled={busy || checkoutUncertain} placeholder="Scan or enter a barcode"/><button type="submit" disabled={busy || checkoutUncertain || !barcode.trim()}>Add item</button></div>
+          <label htmlFor="pos-barcode">{tr('Scan barcode')}</label>
+          <div className="pos-scan-row"><input id="pos-barcode" ref={scanInput} value={barcode} onChange={event => setBarcode(event.target.value)} autoComplete="off" disabled={busy || checkoutUncertain} placeholder={tr('Scan or enter a barcode')}/><button type="submit" disabled={busy || checkoutUncertain || !barcode.trim()}>{tr('Add item')}</button></div>
         </form>
-        <p className="pos-cashier-note">Prices and availability are checked by the POS server. Discounts are fixed amounts per line and validated again at checkout; the server receipt is final.</p>
-        {basket.length === 0 && <p className="pos-cashier-empty">Basket is empty. Scan an active product to begin.</p>}
+        <p className="pos-cashier-note">{tr('Prices and availability are checked by the POS server. Discounts are fixed amounts per line and validated again at checkout; the server receipt is final.')}</p>
+        {basket.length === 0 && <p className="pos-cashier-empty">{tr('Basket is empty. Scan an active product to begin.')}</p>}
         <ul className="pos-basket">
           {basket.map(line => <li key={line.item.id}>
-            <div><strong>{line.item.name}</strong><small>{line.item.barcode} · ${line.item.price} each</small></div>
-            <label>Quantity<input aria-label={`Quantity ${line.item.name}`} type="number" min="1" max="1000" step="1" value={line.quantity} onChange={event => updateQuantity(line.item.id, Number(event.target.value))} disabled={!writable || busy || checkoutUncertain}/></label>
-            <label>Line discount<input aria-label={`Discount ${line.item.name}`} type="number" min="0" max={line.item.price * line.quantity} step="1" value={line.discountAmount} onChange={event => updateDiscount(line.item.id, Number(event.target.value))} disabled={!writable || busy || checkoutUncertain}/></label>
+            <div><strong>{line.item.name}</strong><small>{line.item.barcode} · ${line.item.price} {tr('each')}</small></div>
+            <label>{tr('Quantity')}<input aria-label={`${tr('Quantity')} ${line.item.name}`} type="number" min="1" max="1000" step="1" value={line.quantity} onChange={event => updateQuantity(line.item.id, Number(event.target.value))} disabled={!writable || busy || checkoutUncertain}/></label>
+            <label>{tr('Line discount')}<input aria-label={`${tr('Discount')} ${line.item.name}`} type="number" min="0" max={line.item.price * line.quantity} step="1" value={line.discountAmount} onChange={event => updateDiscount(line.item.id, Number(event.target.value))} disabled={!writable || busy || checkoutUncertain}/></label>
             <strong>${line.item.price * line.quantity - line.discountAmount}</strong>
-            <button type="button" className="pos-remove" onClick={() => removeItem(line.item.id)} disabled={!writable || busy || checkoutUncertain} aria-label={`Remove ${line.item.name}`}>Remove</button>
+            <button type="button" className="pos-remove" onClick={() => removeItem(line.item.id)} disabled={!writable || busy || checkoutUncertain} aria-label={`${tr('Remove')} ${line.item.name}`}>{tr('Remove')}</button>
           </li>)}
         </ul>
       </section>
 
-      <section className="pos-cashier-panel pos-payment-panel" aria-label="Cash payment">
-        <h2>Cash payment</h2>
-        <div className="pos-money-row"><span>Subtotal</span><strong>Subtotal ${subtotal}</strong></div>
-        <div className="pos-money-row"><span>Discount</span><strong>-${discountAmount}</strong></div>
-        <div className="pos-money-total"><span>Total due</span><strong>${total}</strong></div>
-        <label htmlFor="pos-tender">Cash tendered</label>
-        <input id="pos-tender" aria-label="Cash tendered" type="number" min="0" step="1" value={tender} onChange={event => { setTender(event.target.value); retryKey.current = ''; }} disabled={!writable || busy || checkoutUncertain}/>
-        <div className="pos-money-row"><span>Change</span><strong>Change ${change}</strong></div>
-        <button type="button" className="pos-checkout" onClick={() => void checkout()} disabled={!writable || busy || !activeShift || !basket.length || !Number.isSafeInteger(tenderAmount) || tenderAmount < total}>{checkoutUncertain ? 'Retry same sale' : 'Complete cash sale'}</button>
-        {receipt && <div className="pos-receipt" role="status"><strong>Receipt {receipt.receiptNumber}</strong><span>Subtotal ${receipt.subtotal}</span><span>Discount -${receipt.discountAmount}</span><span>Total ${receipt.totalAmount}</span><span>Change ${receipt.changeAmount}</span><span>Receipt amounts are calculated by the POS server.</span></div>}
+      <section className="pos-cashier-panel pos-payment-panel" aria-label={tr('Cash payment')}>
+        <h2>{tr('Cash payment')}</h2>
+        <div className="pos-money-row"><span>{tr('Subtotal')}</span><strong>{tr('Subtotal')} ${subtotal}</strong></div>
+        <div className="pos-money-row"><span>{tr('Discount')}</span><strong>-${discountAmount}</strong></div>
+        <div className="pos-money-total"><span>{tr('Total due')}</span><strong>${total}</strong></div>
+        <label htmlFor="pos-tender">{tr('Cash tendered')}</label>
+        <input id="pos-tender" aria-label={tr('Cash tendered')} type="number" min="0" step="1" value={tender} onChange={event => { setTender(event.target.value); retryKey.current = ''; }} disabled={!writable || busy || checkoutUncertain}/>
+        <div className="pos-money-row"><span>{tr('Cash change')}</span><strong>{tr('Cash change')} ${change}</strong></div>
+        <button type="button" className="pos-checkout" onClick={() => void checkout()} disabled={!writable || busy || !activeShift || !basket.length || !Number.isSafeInteger(tenderAmount) || tenderAmount < total}>{checkoutUncertain ? tr('Retry same sale') : tr('Complete cash sale')}</button>
+        {receipt && <div className="pos-receipt" role="status"><strong>{tr('Receipt')} {receipt.receiptNumber}</strong><span>{tr('Subtotal')} ${receipt.subtotal}</span><span>{tr('Discount')} -${receipt.discountAmount}</span><span>{tr('Total due')} ${receipt.totalAmount}</span><span>{tr('Cash change')} ${receipt.changeAmount}</span><span>{tr('Receipt amounts are calculated by the POS server.')}</span></div>}
       </section>
     </div>
   </section>;
