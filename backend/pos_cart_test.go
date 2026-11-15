@@ -113,8 +113,11 @@ func TestPOSCartClaimAndMultiItemCheckout(t *testing.T) {
 	}
 	total := products[0].price + 2*products[1].price
 	checkout := map[string]any{"action": "checkout", "shiftId": shift, "cartId": cart, "tender": total + 100, "idempotencyKey": "cart-checkout-0001"}
-	if w := request(a, "POST", path, checkout, loser...); w.Code != 409 {
-		t.Fatalf("foreign claim checkout %d", w.Code)
+	loserCheckout := map[string]any{"action": "checkout", "shiftId": shift, "cartId": cart, "tender": total + 100, "idempotencyKey": "cart-checkout-loser-01"}
+	if w := request(a, "POST", path, loserCheckout, loser...); w.Code != 409 || !strings.Contains(w.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("foreign claim checkout should be a generic terminal conflict: %d %s", w.Code, w.Body.String())
+	} else if replay := request(a, "POST", path, loserCheckout, loser...); replay.Code != w.Code || replay.Body.String() != w.Body.String() {
+		t.Fatalf("foreign claim checkout marker replay differs: %d %s", replay.Code, replay.Body.String())
 	}
 	w = request(a, "POST", path, checkout, winner.cookies...)
 	if w.Code != 200 {
@@ -250,8 +253,11 @@ func TestPOSCartTenderMustCoverDiscountedTotal(t *testing.T) {
 	if e := a.db.QueryRow("SELECT count(*) FROM idempotency_keys WHERE organization_id=? AND key=?", org, in["idempotencyKey"]).Scan(&keys); e != nil {
 		t.Fatal(e)
 	}
-	if sales != 0 || keys != 0 {
+	if sales != 0 || keys != 1 {
 		t.Fatalf("under-tender left writes: sales=%d idempotency=%d", sales, keys)
+	}
+	if !strings.Contains(request(a, "POST", "/api/stations/pos/cart", in, staff...).Body.String(), `"outcome":"not_applied"`) {
+		t.Fatal("under-tender rejection must be durably marked not_applied for retry recovery")
 	}
 }
 

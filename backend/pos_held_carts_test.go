@@ -258,8 +258,13 @@ func TestPOSClaimedCartRecoveryAndServerValidatedCorrection(t *testing.T) {
 		"lines":          []any{map[string]any{"itemId": item, "quantity": 2, "discountAmount": price / 4}},
 		"idempotencyKey": "recover-update-0001",
 	}
-	if w := request(a, http.MethodPost, "/api/stations/pos/cart", corrected, admin...); w.Code != http.StatusConflict {
-		t.Fatalf("non-claimant admin cannot rewrite cart: %d %s", w.Code, w.Body.String())
+	adminAttempt := map[string]any{
+		"action": "update", "shiftId": shift, "cartId": cartID,
+		"lines":          []any{map[string]any{"itemId": item, "quantity": 2, "discountAmount": price / 4}},
+		"idempotencyKey": "recover-update-admin-01",
+	}
+	if w := request(a, http.MethodPost, "/api/stations/pos/cart", adminAttempt, admin...); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("same-store non-claimant update should return generic terminal conflict: %d %s", w.Code, w.Body.String())
 	}
 	invalid := map[string]any{
 		"action": "update", "shiftId": shift, "cartId": cartID,
@@ -411,8 +416,9 @@ func TestPOSClaimedCartDiscardIsOwnerOnlyIdempotentAndHasNoSaleEffects(t *testin
 		t.Fatalf("claim: %d %s", claim.Code, claim.Body.String())
 	}
 	discard := map[string]any{"action": "discard", "shiftId": shift, "cartId": held.Data.CartID, "idempotencyKey": "discard-cart-0001"}
-	if w := request(a, http.MethodPost, "/api/stations/pos/cart", discard, admin...); w.Code != http.StatusConflict {
-		t.Fatalf("non-claimant admin discard: %d %s", w.Code, w.Body.String())
+	adminDiscard := map[string]any{"action": "discard", "shiftId": shift, "cartId": held.Data.CartID, "idempotencyKey": "discard-cart-admin-01"}
+	if w := request(a, http.MethodPost, "/api/stations/pos/cart", adminDiscard, admin...); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"outcome":"not_applied"`) {
+		t.Fatalf("same-store non-claimant discard should return generic terminal conflict: %d %s", w.Code, w.Body.String())
 	}
 	w := request(a, http.MethodPost, "/api/stations/pos/cart", discard, front...)
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"status":"cancelled"`) {

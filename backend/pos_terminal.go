@@ -20,5 +20,19 @@ func (a *App) posTerminal(w http.ResponseWriter, r *http.Request, id *Identity) 
 		fail(w, http.StatusServiceUnavailable, "Cannot read your open shifts")
 		return
 	}
+	for _, shift := range shifts {
+		shiftID, idOK := shift["id"].(string)
+		opening, openingOK := shift["openingCash"].(int64)
+		if !idOK || !openingOK {
+			fail(w, http.StatusServiceUnavailable, "Invalid open shift data")
+			return
+		}
+		expected, e := posShiftExpectedCash(a.db, id.OrganizationID, shiftID, opening)
+		if e != nil {
+			fail(w, http.StatusServiceUnavailable, "Cannot calculate current drawer balance")
+			return
+		}
+		shift["expectedCash"] = expected
+	}
 	ok(w, map[string]any{"registers": registers, "openShifts": shifts})
 }

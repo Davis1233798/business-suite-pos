@@ -20,6 +20,12 @@
 
 本次由目前 Codex 主代理與三個同模型子代理完成整合，未使用不可用的指定替代模型。
 
+## P06 現金異動與班結差額：後端增量
+
+此工作樹從最新 `origin/main` 的 P05 merge commit 建立。後端已加入現金 in/out、收銀員端 terminal open shift 的目前 expectedCash、非平衡班結說明及 signed discrepancy。現金異動與關班使用同一資料庫交易、冪等回應與 audit 寫入；確定的 invalid/closed/overdraw rejection 會先預留同一 request fingerprint 的 terminal retry row 再回傳 `not_applied`，交易或 commit 不確定則不宣稱無副作用。班結重新從 cash sales、cash movements、cash refunds 計算 expected total，關班差額說明寫入既有 `pos_shifts.notes`。現金異動允許 shift owner 或同組織 back-office admin；唯讀與其他前台收銀員不可操作。
+
+驗證：`go test ./... -count=1` 通過；兩個 SQLite handle 的超額 cash-out、cash movement/close、refund/cash-out、refund/close 競爭測試各重跑 10 次通過，四種競爭路徑以 `go test -race` 通過。Go 測試亦確認可用明確 cash-in 恢復既有負 expected cash，且不改寫舊 movement；新增回歸測試以舊版 command JSON 指紋與已存冪等結果驗證升級後 refund/checkout 重送仍可重播。新增 command 欄位為零值時省略，因此既有 open/checkout/refund 指紋相容；不確定結果仍須凍結並以原 payload/key 重試，只有交易內已保存的終態 `not_applied` 可安全釋放該次嘗試。POS cart deterministic validation/state errors 也先持久化 terminal idempotency result；same-key replay returns the marker, changed payload conflicts unmarked, and authorization denials/database uncertainty remain unmarked. 關班會拒絕同店同收銀員仍有 retrieved 掛單的狀態，shared held 不阻擋；shift-close／claim race 測試確認不會關班後留下新 claim，已關班的本人掛單只允許 release/discard 恢復。Cart validation、same-store other-claim conflict、close/claim race 跨 SQLite handles 各重跑 10 次通過；測試確認 generic 409 marker 不洩漏 claimant／lock ID，而 shift-owner 403 保持未標記且不佔用 key；rollback 測試確認後續庫存競爭失敗不留下部分銷售或扣庫。Cashier Playwright 51/51，涵蓋重新載入後恢復 pending held-cart update、終態拒絕仍保留草稿且可用新 key、closed-shift neutral recovery／新班次取回、釋出與作廢，以及先掃描商品、開班後保留購物籃並結帳；`npx tsc --noEmit`、`npx eslint web/src/PosCashier.tsx web/src/PosRefunds.tsx web/src/locale.ts`、`npm run web:build` 與 `git diff --check` 通過。另在隔離暫存 SQLite 上執行真實 Go API／瀏覽器流程：cash in 20、cash out 5，關班預期現金 1015、實點 1012、差額 -3 並附差異說明；SQLite 確認班次 closing/expected/variance/note、兩筆異動、三筆對應稽核事件及三筆成功冪等紀錄。隔離資料庫與測試產物已清除。此工作樹未提交／部署，完整 P01–P08 與正式會計核對仍未完成。設計及界線見 `docs/engineering/POS_CASH_MOVEMENTS.md`。
+
 已實作個人作品首頁、MES、ERP、POS、CRM、餐飲與電商前後台；使用真正 D1 持久化、訪客展示空間、模擬角色、原子庫存／付款／報工交易、種子重置、完整業務備份還原及 CSV。
 
 驗證：npx tsc --noEmit 通過；npm test 28/28 通過；Sites build-site 正式建置成功；scripts/smoke-http.mjs 對本機正式 Worker 8787 完整通過。POS 瀏覽器操作確認兩件100折10、收200找10。
