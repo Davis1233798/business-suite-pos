@@ -18,6 +18,23 @@ async function cashier(page: import('@playwright/test').Page, role: 'operator' |
   await expect(page.getByRole('heading', { name: language === 'zh-TW' ? '收銀' : 'Cashier' })).toBeVisible();
 }
 
+async function posBackOffice(page: import('@playwright/test').Page, role: 'admin' | 'operator' | 'readonly' = 'admin', scope: 'back' | 'front' = 'back', language: 'en' | 'zh-TW' = 'en') {
+  await page.addInitScript(selectedLanguage => localStorage.setItem('suite-language', selectedLanguage), language);
+  await page.route('**/api/auth/me?site=pos', route => route.fulfill({ json: { success: true, data: {
+    userId: 'manager-a', organizationId: 'org-a', name: 'Manager', email: 'manager@example.test',
+    grants: [{ site: 'pos', role, scope, enabled: true }],
+  } } }));
+  await page.route('**/api/stations/pos/data?view=back', route => route.fulfill({ json: { success: true, data: {
+    catalogItems: [], sales: [], saleLines: [], stores: [], registers: [], shifts: [], heldCarts: [],
+  } } }));
+  await page.goto('/pos/refunds');
+}
+
+const refundSale = {
+  saleId: 'sale-a', receiptNumber: 'POS-REFUND-001', saleStatus: 'completed', paymentMethod: 'cash', shiftStatus: 'open', eligible: true,
+  lines: [{ saleLineId: 'line-a', itemId: 'item-a', name: 'Coffee', barcode: '4710001001', quantity: 3, refundedQuantity: 0, remainingQuantity: 3, lineTotal: 101 }],
+};
+
 test('cashier opens a shift, scans twice, applies a fixed line discount, and retries checkout with the same key', async ({ page }) => {
   let openShifts: Array<{ id: string; registerId: string; status: string }> = [];
   const openRequests: Record<string, unknown>[] = [];
@@ -798,4 +815,194 @@ test('held-cart pages expose older owned claims and resume them through a scoped
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
   expect(cursors).toEqual(['', 'next-page-token']);
   expect(targetedRead).toBe(true);
+});
+
+test('admin refund lookup submits a reviewed line quantity and shows the authoritative amount', async ({ page }) => {
+  let currentRefunded = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: {
+    ...refundSale,
+    lines: refundSale.lines.map(line => ({ ...line, refundedQuantity: currentRefunded, remainingQuantity: line.quantity - currentRefunded })),
+  } } }));
+  const refundRequests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON(); refundRequests.push(body);
+    expect(body).toMatchObject({ action: 'refund', saleLineId: 'line-a', quantity: 1, reason: 'Customer return' });
+    expect(body.idempotencyKey).toEqual(expect.any(String));
+    currentRefunded += 1;
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-a', refundNumber: 'REF-001', refundAmount: 33, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await expect(page.getByRole('heading', { name: 'Refunds' })).toBeVisible();
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await expect(page.getByLabel('Estimated refund')).toHaveText('$33');
+  await page.getByLabel('Refund quantity').fill('1');
+  await page.getByLabel('Refund reason').fill('Customer return');
+  let confirmation = '';
+  page.once('dialog', async dialog => { confirmation = dialog.message(); await dialog.accept(); });
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  expect(confirmation).toContain('Coffee');
+  expect(confirmation).toContain('$33');
+  await expect(page.getByRole('status').filter({ hasText: 'REF-001' })).toContainText('$33');
+  await expect(page.getByText('2 remaining', { exact: true })).toBeVisible();
+  expect(refundRequests).toHaveLength(1);
+  expect(refundRequests[0]).not.toHaveProperty('refundAmount');
+});
+
+test('cash refund lookup shows closed-shift and non-cash receipts as ineligible', async ({ page }) => {
+  await page.route('**/api/stations/pos/refund-lookup?**', route => {
+    const receiptNumber = new URL(route.request().url()).searchParams.get('receiptNumber');
+    const closed = receiptNumber === 'POS-CLOSED';
+    const sale = { ...refundSale, receiptNumber, paymentMethod: closed ? 'cash' : 'card', shiftStatus: closed ? 'closed' : 'open', eligible: false };
+    return route.fulfill({ json: { success: true, data: sale } });
+  });
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', route => { requests.push(route.request().postDataJSON()); return route.fulfill({ status: 409, json: { success: false, error: { message: 'Ineligible' } } }); });
+  await posBackOffice(page);
+  await expect(page.getByRole('heading', { name: 'Refunds' })).toBeVisible();
+  await page.getByLabel('Receipt number').fill('POS-CLOSED');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await expect(page.getByText(/original shift is closed/i)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeDisabled();
+  await page.getByLabel('Receipt number').fill('POS-CARD');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await expect(page.getByText(/cash sales only/i)).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Review refund' })).toBeDisabled();
+  expect(requests).toHaveLength(0);
+});
+
+test('ambiguous refund retries the exact payload and idempotency key', async ({ page }) => {
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
+  const refundRequests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    refundRequests.push(route.request().postDataJSON());
+    if (refundRequests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary refund failure' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-retry', refundNumber: 'REF-RETRY', refundAmount: 33, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await expect(page.getByLabel('Refund reason')).toBeDisabled();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'REF-RETRY' })).toBeVisible();
+  expect(refundRequests).toHaveLength(2);
+  expect(refundRequests[1]).toEqual(refundRequests[0]);
+});
+
+test('ambiguous refund remains frozen and retryable after a page reload', async ({ page }) => {
+  await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
+  const refundRequests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    refundRequests.push(route.request().postDataJSON());
+    if (refundRequests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary refund failure' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-recovered', refundNumber: 'REF-RECOVERED', refundAmount: 33, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  const originalRequest = refundRequests[0];
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await expect(page.getByLabel('Refund quantity')).toHaveValue('1');
+  await expect(page.getByLabel('Refund reason')).toBeDisabled();
+  await expect(page.getByLabel('Refund reason')).toHaveValue('Customer return');
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'REF-RECOVERED' })).toBeVisible();
+  expect(refundRequests).toHaveLength(2);
+  expect(refundRequests[1]).toEqual(originalRequest);
+});
+
+test('saved ambiguous refund can retry when receipt recovery lookup fails', async ({ page }) => {
+  let lookupCount = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', async route => {
+    lookupCount += 1;
+    if (lookupCount === 2) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Lookup temporarily unavailable' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: refundSale } });
+  });
+  const refundRequests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    refundRequests.push(route.request().postDataJSON());
+    if (refundRequests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary refund failure' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { refundId: 'refund-recovered', refundNumber: 'REF-RECOVERED', refundAmount: 33, quantity: 1 } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  const originalRequest = refundRequests[0];
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toBeVisible();
+  await expect(page.getByRole('alert')).toContainText('Lookup temporarily unavailable');
+  await expect(page.getByText('Refund quantity: 1')).toBeVisible();
+  await expect(page.getByText('Refund reason: Customer return')).toBeVisible();
+  await page.getByRole('button', { name: 'Retry refund' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'REF-RECOVERED' })).toBeVisible();
+  expect(refundRequests).toHaveLength(2);
+  expect(refundRequests[1]).toEqual(originalRequest);
+});
+
+test('back-office operators do not see the admin refund workflow', async ({ page }) => {
+  await posBackOffice(page, 'operator', 'back');
+  await expect(page.getByRole('heading', { name: 'Refunds' })).toHaveCount(0);
+  await expect(page.getByLabel('Receipt number')).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'Refunds' })).toHaveCount(0);
+});
+
+test('admin refund workflow follows the active Traditional Chinese language', async ({ page }) => {
+  await posBackOffice(page, 'admin', 'back', 'zh-TW');
+  await expect(page.getByRole('heading', { name: '退款' })).toBeVisible();
+  await expect(page.getByLabel('收據號碼')).toBeVisible();
+  await expect(page.getByRole('link', { name: '退款' })).toBeVisible();
+});
+
+test('stale refund quantity rejection refreshes the exact receipt before another attempt', async ({ page }) => {
+  let lookupCount = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', route => {
+    lookupCount += 1;
+    const currentRemaining = lookupCount === 1 ? 3 : 1;
+    return route.fulfill({ json: { success: true, data: {
+      ...refundSale,
+      lines: refundSale.lines.map(line => ({ ...line, refundedQuantity: line.quantity - currentRemaining, remainingQuantity: currentRemaining })),
+    } } });
+  });
+  let postCount = 0;
+  await page.route('**/api/stations/pos/business', async route => {
+    postCount += 1;
+    await route.fulfill({ status: 409, json: { success: false, error: { message: 'Refund quantity changed; retry' } } });
+  });
+  await posBackOffice(page);
+  await page.getByLabel('Receipt number').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: 'Find receipt' }).click();
+  await page.getByLabel('Refund quantity').fill('3');
+  await page.getByLabel('Refund reason').fill('Customer return');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review refund' }).click();
+  await expect(page.getByRole('alert')).toContainText('Refund quantity changed');
+  await expect(page.getByText('1 remaining', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry refund' })).toHaveCount(0);
+  expect(lookupCount).toBe(2);
+  expect(postCount).toBe(1);
 });

@@ -181,10 +181,10 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		result = map[string]any{"saleId": entityID, "receiptNumber": receipt, "totalAmount": total, "changeAmount": change}
 	case "refund":
-		var saleID, itemID, shiftStatus, saleStatus string
+		var saleID, itemID, shiftStatus, saleStatus, paymentMethod string
 		var sold, refunded int
 		var lineTotal int64
-		e = tx.QueryRow(`SELECT l.sale_id,l.item_id,l.quantity,l.refunded_quantity,l.line_total,s.status,sh.status FROM pos_sale_lines l JOIN pos_sales s ON s.id=l.sale_id AND s.organization_id=l.organization_id JOIN pos_shifts sh ON sh.id=s.shift_id AND sh.organization_id=s.organization_id WHERE l.id=? AND l.organization_id=?`, in.SaleLineID, id.OrganizationID).Scan(&saleID, &itemID, &sold, &refunded, &lineTotal, &saleStatus, &shiftStatus)
+		e = tx.QueryRow(`SELECT l.sale_id,l.item_id,l.quantity,l.refunded_quantity,l.line_total,s.status,sh.status,s.payment_method FROM pos_sale_lines l JOIN pos_sales s ON s.id=l.sale_id AND s.organization_id=l.organization_id JOIN pos_shifts sh ON sh.id=s.shift_id AND sh.organization_id=s.organization_id WHERE l.id=? AND l.organization_id=?`, in.SaleLineID, id.OrganizationID).Scan(&saleID, &itemID, &sold, &refunded, &lineTotal, &saleStatus, &shiftStatus, &paymentMethod)
 		if errors.Is(e, sql.ErrNoRows) {
 			fail(w, 404, "Sale line not found")
 			return
@@ -193,8 +193,8 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 			fail(w, 503, "Cannot read sale line")
 			return
 		}
-		if saleStatus != "completed" || shiftStatus != "open" || sold < 1 || sold > 1000000 || refunded < 0 || in.Quantity > sold-refunded || lineTotal < 0 || lineTotal > 1000000000 {
-			fail(w, 409, "Refund exceeds the remaining quantity or the original shift is closed")
+		if saleStatus != "completed" || shiftStatus != "open" || paymentMethod != "cash" || sold < 1 || sold > 1000000 || refunded < 0 || in.Quantity > sold-refunded || lineTotal < 0 || lineTotal > 1000000000 {
+			fail(w, 409, "Sale is not eligible for refund: it must be completed, paid in cash, on an open original shift, and have remaining quantity")
 			return
 		}
 		amount := lineTotal*int64(refunded+in.Quantity)/int64(sold) - lineTotal*int64(refunded)/int64(sold)
