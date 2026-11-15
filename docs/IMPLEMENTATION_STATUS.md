@@ -10,7 +10,7 @@
 
 目前 `codex/pos-p04-held-carts` 工作樹增加掛單清單與暫存、競取、取回、釋出、修正及作廢。Go 僅列同店 held carts 和登入者自己的 retrieved carts；自己的已取回掛單在最多 100 筆清單中優先，方便重整後接續。更正由原 claim owner 提交，Go 依當前商品價格驗證並原子更新；作廢僅能由 claim owner 執行，記錄稽核及冪等結果，不建立銷售或扣庫。
 
-本分支驗證：`go test ./... -count=1` 通過；`npx playwright test --config=playwright.cashier.config.ts` 18/18；`npx tsc --noEmit`、`npm run web:build`、`npx eslint web/src/PosCashier.tsx` 與 `git diff --check` 通過。Playwright 競取為兩個瀏覽器 context 共用 mock API 狀態；真實 SQLite 競取仍由 Go API 測試覆蓋。Lifecycle 與真實 API 瀏覽器流程本次未能完成：測試環境未保留可檢查的隔離資料庫與服務記錄，且沒有正在監聽的測試 API。此工作尚未合併／部署；跨店轉移、關班後恢復、離線交易與完整 P01–P08 驗收未涵蓋。詳見 `docs/engineering/POS_HELD_CART_UI.md`。
+本分支驗證：`go test ./... -count=1` 通過；`npx playwright test --config=playwright.cashier.config.ts` 18/18；`npx tsc --noEmit`、`npm run web:build`、`npx eslint web/src/PosCashier.tsx` 與 `git diff --check` 通過。`npx playwright test --config=playwright.lifecycle.config.ts` 3/3 通過，使用獨立 Go API、Vite 與同源本機代理。另以全新暫存 SQLite 執行真實 Go API／瀏覽器掛單流程：暫存、取回、折讓更正、重新載入後恢復及結帳皆成功；瀏覽器收據顯示伺服器金額 subtotal 200、折讓 15、應收 185，SQLite 確認掛單 completed 且現金銷售金額 185。Playwright 競取仍是兩個瀏覽器 context 共用 mock API；真實 SQLite 競取由 Go API 測試覆蓋。此工作尚未合併／部署；跨店轉移、關班後恢復、離線交易與完整 P01–P08 驗收未涵蓋。詳見 `docs/engineering/POS_HELD_CART_UI.md`。
 
 本次由目前 Codex 主代理與三個同模型子代理完成整合，未使用不可用的指定替代模型。
 
