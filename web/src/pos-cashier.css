@@ -15,6 +15,20 @@
 .pos-shift-open { grid-template-columns: repeat(3, minmax(0, 1fr)); align-items: end; }
 .pos-shift-open h2 { grid-column: 1 / -1; }
 .pos-shift-open p { grid-column: 1 / -1; margin: 0; color: #78716c; font-size: .85rem; }
+.pos-held-heading, .pos-held-list li, .pos-claimed-cart { display: flex; align-items: center; justify-content: space-between; gap: .75rem; }
+.pos-held-heading h2 { margin: 0; }
+.pos-cashier .pos-secondary { min-height: 2.35rem; border: 1px solid #d6d3d1; background: #fff; color: #44403c; padding: .4rem .65rem; font-size: .82rem; }
+.pos-cashier .pos-discard { justify-self: start; border: 1px solid #fecaca; background: #fef2f2; color: #991b1b; }
+.pos-held-list { display: grid; gap: .55rem; margin: 0; padding: 0; list-style: none; }
+.pos-held-list li { border-top: 1px solid #f5f5f4; padding-top: .65rem; }
+.pos-held-summary { display: grid; min-width: 0; gap: .2rem; }
+.pos-held-summary strong { overflow-wrap: anywhere; }
+.pos-held-summary small { color: #78716c; }
+.pos-held-unavailable { color: #991b1b !important; }
+.pos-held-retry { display: flex; align-items: center; justify-content: space-between; gap: .75rem; border-radius: .6rem; background: #fffbeb; padding: .65rem .8rem; }
+.pos-held-retry p { margin: 0; color: #92400e; font-size: .85rem; }
+.pos-hold-controls { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: end; gap: .6rem; border-top: 1px solid #e7e5e4; padding-top: .8rem; }
+.pos-claimed-cart { flex-wrap: wrap; border-radius: .6rem; background: #f5f5f4; padding: .55rem .7rem; font-size: .85rem; font-weight: 700; }
 .pos-scan-panel form { display: grid; gap: .4rem; }
 .pos-scan-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .5rem; }
 .pos-cashier-note, .pos-cashier-empty { margin: 0; color: #78716c; font-size: .82rem; line-height: 1.5; }
@@ -42,6 +56,8 @@
   .pos-cashier-header { align-items: flex-start; flex-direction: column; }
   .pos-shift-open { grid-template-columns: 1fr; }
   .pos-shift-open h2, .pos-shift-open p { grid-column: auto; }
+  .pos-held-heading, .pos-held-list li, .pos-held-retry { align-items: stretch; flex-direction: column; }
+  .pos-hold-controls { grid-template-columns: 1fr; }
   .pos-cashier-grid { grid-template-columns: 1fr; }
   .pos-payment-panel { position: static; }
   .pos-basket li { grid-template-columns: minmax(0, 1fr) 4rem 4.5rem; gap: .45rem; }

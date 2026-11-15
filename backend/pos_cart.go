@@ -33,7 +33,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		return
 	}
 	var in posCartRequest
-	if body(r, &in) != nil || len(in.Key) < 8 || len(in.Key) > 128 || in.ShiftID == "" || len(in.ShiftID) > 256 || len(in.CartID) > 256 || in.Tender < 0 || in.Tender > 1000000000 || (in.Action != "hold" && in.Action != "claim" && in.Action != "release" && in.Action != "checkout") {
+	if body(r, &in) != nil || len(in.Key) < 8 || len(in.Key) > 128 || in.ShiftID == "" || len(in.ShiftID) > 256 || len(in.CartID) > 256 || in.Tender < 0 || in.Tender > 1000000000 || (in.Action != "hold" && in.Action != "claim" && in.Action != "release" && in.Action != "update" && in.Action != "discard" && in.Action != "checkout") {
 		fail(w, 400, "Invalid cart request")
 		return
 	}
@@ -42,8 +42,12 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		fail(w, 400, "Enter a cart name and items")
 		return
 	}
-	if (in.Action == "claim" || in.Action == "release") && in.CartID == "" {
+	if (in.Action == "claim" || in.Action == "release" || in.Action == "update" || in.Action == "discard") && in.CartID == "" {
 		fail(w, 400, "Select a cart")
+		return
+	}
+	if in.Action == "update" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
+		fail(w, 400, "Cart must contain 1 to 100 items")
 		return
 	}
 	if in.Action == "checkout" && in.CartID == "" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
@@ -99,7 +103,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 	entity := ""
 	result := map[string]any{}
 	lines := in.Lines
-	if in.Action == "claim" || in.Action == "release" || (in.Action == "checkout" && in.CartID != "") {
+	if in.Action == "claim" || in.Action == "release" || in.Action == "update" || in.Action == "discard" || (in.Action == "checkout" && in.CartID != "") {
 		var cartStore, cartStatus, locked, stored string
 		e = tx.QueryRow("SELECT store_id,status,COALESCE(locked_by,''),items_json FROM pos_held_carts WHERE organization_id=? AND id=?", id.OrganizationID, in.CartID).Scan(&cartStore, &cartStatus, &locked, &stored)
 		if errors.Is(e, sql.ErrNoRows) {
@@ -131,6 +135,30 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			_, e = tx.Exec("UPDATE pos_held_carts SET status='held',locked_by=NULL WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
 			result = map[string]any{"cartId": entity, "status": "held"}
 		}
+		if in.Action == "update" {
+			if cartStatus != "retrieved" || locked != id.UserID {
+				fail(w, 409, "Only the claimant can update this cart")
+				return
+			}
+		}
+		if in.Action == "discard" {
+			if cartStatus != "retrieved" || locked != id.UserID {
+				fail(w, 409, "Only the claimant can discard this cart")
+				return
+			}
+			updated, updateErr := tx.Exec("UPDATE pos_held_carts SET status='cancelled',locked_by=NULL WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
+			e = updateErr
+			if e == nil {
+				var count int64
+				count, e = updated.RowsAffected()
+				if e == nil && count != 1 {
+					fail(w, 409, "Only the claimant can discard this cart")
+					return
+				}
+			}
+			entity = in.CartID
+			result = map[string]any{"cartId": entity, "status": "cancelled"}
+		}
 		if in.Action == "checkout" {
 			if cartStatus != "retrieved" || locked != id.UserID {
 				fail(w, 409, "Claim this cart before checkout")
@@ -142,7 +170,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			}
 		}
 	}
-	if in.Action == "hold" || in.Action == "checkout" {
+	if in.Action == "hold" || in.Action == "update" || in.Action == "checkout" {
 		if len(lines) == 0 || len(lines) > 100 {
 			fail(w, 400, "Cart must contain 1 to 100 items")
 			return
@@ -195,6 +223,20 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			entity = "cart_" + token()
 			_, e = tx.Exec("INSERT INTO pos_held_carts(id,organization_id,store_id,cart_name,items_json,status) VALUES(?,?,?,?,?,'held')", entity, id.OrganizationID, store, in.CartName, string(encoded))
 			result = map[string]any{"cartId": entity, "status": "held"}
+		} else if in.Action == "update" {
+			encoded, _ := json.Marshal(lines)
+			updated, updateErr := tx.Exec("UPDATE pos_held_carts SET items_json=? WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", string(encoded), id.OrganizationID, in.CartID, id.UserID)
+			e = updateErr
+			if e == nil {
+				var count int64
+				count, e = updated.RowsAffected()
+				if e == nil && count != 1 {
+					fail(w, 409, "Only the claimant can update this cart")
+					return
+				}
+			}
+			entity = in.CartID
+			result = map[string]any{"cartId": entity, "status": "retrieved"}
 		} else {
 			if in.Tender < total {
 				fail(w, 400, "Cash tender is less than the total")
