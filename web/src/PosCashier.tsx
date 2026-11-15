@@ -3,7 +3,7 @@ import { tr } from './locale';
 import './pos-cashier.css';
 
 type Register = { id: string; name: string; storeId: string };
-type Shift = { id: string; registerId: string; storeId: string; openingCash: number; openedAt: string };
+type Shift = { id: string; registerId: string; storeId: string; openingCash: number; expectedCash: number; openedAt: string };
 type Terminal = { registers: Register[]; openShifts: Shift[] };
 type Product = { id: string; name: string; barcode: string; price: number; stockQuantity: number; isActive?: boolean };
 type BasketLine = { item: Product; quantity: number; discountAmount: number };
@@ -12,16 +12,19 @@ type HeldCartLine = { itemId: string; quantity: number; discountAmount: number; 
 type HeldCart = { cartId: string; cartName: string; heldAt: string; status: 'held' | 'retrieved'; lines: HeldCartLine[] };
 type HeldCartPage = { items: HeldCart[]; hasMore: boolean; nextCursor: string };
 type HeldOperation = { action: 'hold' | 'claim' | 'update' | 'release' | 'discard'; body: Record<string, unknown>; idempotencyKey: string };
+type CashMovement = { movementId: string; shiftId: string; movementType: 'in' | 'out'; amount: number; reason: string };
+type ShiftCloseResult = { shiftId: string; status: 'closed'; expectedCash: number; closingCash: number; discrepancy: number };
+type ShiftOperation = { action: 'cash-movement' | 'close'; shiftId: string; idempotencyKey: string; movementType?: 'in' | 'out'; amount?: number; reason?: string; closingCash?: number; notes?: string };
 const HELD_CART_PAGE_SIZE = 50;
 
 class ApiError extends Error {
-  constructor(message: string, readonly status: number) { super(message); }
+  constructor(message: string, readonly status: number, readonly outcome?: string) { super(message); }
 }
 
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(path, { credentials: 'same-origin', ...init });
-  const envelope = await response.json() as { success?: boolean; error?: { message?: string }; data?: T };
-  if (!response.ok || !envelope.success) throw new ApiError(tr(envelope.error?.message || `HTTP ${response.status}`), response.status);
+  const envelope = await response.json() as { success?: boolean; error?: { message?: string; outcome?: string }; data?: T };
+  if (!response.ok || !envelope.success) throw new ApiError(tr(envelope.error?.message || `HTTP ${response.status}`), response.status, envelope.error?.outcome);
   return envelope.data as T;
 }
 
@@ -29,8 +32,30 @@ function post<T>(path: string, body: unknown) {
   return api<T>(path, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
 }
 
-export function PosCashier({ role }: { role: string }) {
-  const writable = role !== 'readonly';
+function shiftOperationStorageKey(ownerKey: string) { return `pos-shift-operation:${encodeURIComponent(ownerKey)}`; }
+function readShiftOperation(storageKey: string): ShiftOperation | null {
+  try {
+    const raw = sessionStorage.getItem(storageKey);
+    if (!raw) return null;
+    const value = JSON.parse(raw) as Partial<ShiftOperation>;
+    if ((value.action === 'cash-movement' || value.action === 'close') && typeof value.shiftId === 'string' && typeof value.idempotencyKey === 'string' && value.idempotencyKey.length >= 8) return value as ShiftOperation;
+  } catch { /* malformed/stale local data is never treated as an authorized operation */ }
+  return null;
+}
+function money(value: number) { return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'TWD', maximumFractionDigits: 0 }).format(value); }
+function utf8Length(value: string) { return new TextEncoder().encode(value).length; }
+
+export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string }) {
+  const shiftOperationKey = shiftOperationStorageKey(ownerKey);
+  const [pendingShiftOperation, setPendingShiftOperation] = useState<ShiftOperation | null>(() => readShiftOperation(shiftOperationKey));
+  const pendingShiftOperationRef = useRef<ShiftOperation | null>(pendingShiftOperation);
+  const writable = role !== 'readonly' && pendingShiftOperation === null;
+  const [movementType, setMovementType] = useState<'in' | 'out'>(() => pendingShiftOperation?.action === 'cash-movement' ? pendingShiftOperation.movementType || 'in' : 'in');
+  const [movementAmount, setMovementAmount] = useState(() => pendingShiftOperation?.action === 'cash-movement' ? String(pendingShiftOperation.amount ?? '') : '');
+  const [movementReason, setMovementReason] = useState(() => pendingShiftOperation?.action === 'cash-movement' ? pendingShiftOperation.reason || '' : '');
+  const [closingCash, setClosingCash] = useState(() => pendingShiftOperation?.action === 'close' ? String(pendingShiftOperation.closingCash ?? '') : '');
+  const [varianceNotes, setVarianceNotes] = useState(() => pendingShiftOperation?.action === 'close' ? pendingShiftOperation.notes || '' : '');
+  const [shiftCloseResult, setShiftCloseResult] = useState<ShiftCloseResult | null>(null);
   const [terminal, setTerminal] = useState<Terminal | null>(null);
   const [activeShiftId, setActiveShiftId] = useState('');
   const [registerId, setRegisterId] = useState('');
@@ -98,6 +123,97 @@ export function PosCashier({ role }: { role: string }) {
   const visibleHeldCartsHasMore = !!activeShift && heldCartsShiftId === activeShift.id && heldCartsHasMore;
   const visibleHeldCartsError = activeShift && heldCartsErrorShiftId === activeShift.id ? heldCartsError : '';
   const visibleHeldCartsLoading = activeShift && heldCartsLoadingShiftId === activeShift.id && heldCartsLoading;
+  const expectedDrawerCash = activeShift ? (Number.isSafeInteger(activeShift.expectedCash) ? activeShift.expectedCash : activeShift.openingCash) : 0;
+  const parsedMovementAmount = Number(movementAmount);
+  const movementReasonBytes = utf8Length(movementReason.trim());
+  const movementMaxAmount = Math.min(1000000000, movementType === 'out' ? Math.max(0, expectedDrawerCash) : 1000000000);
+  const parsedClosingCash = closingCash.trim() ? Number(closingCash) : Number.NaN;
+  const closeDiscrepancyEstimate = Number.isSafeInteger(parsedClosingCash) && activeShift ? parsedClosingCash - expectedDrawerCash : null;
+  const varianceReasonBytes = utf8Length(varianceNotes.trim());
+  const shiftOperationLocked = pendingShiftOperation !== null;
+
+  function clearShiftOperation() {
+    pendingShiftOperationRef.current = null;
+    setPendingShiftOperation(null);
+    try { sessionStorage.removeItem(shiftOperationKey); } catch { /* a stale replay remains idempotent */ }
+  }
+
+  function saveShiftOperation(operation: ShiftOperation) {
+    try { sessionStorage.setItem(shiftOperationKey, JSON.stringify(operation)); }
+    catch { setError(tr('Could not safely save this shift request for retry')); return false; }
+    pendingShiftOperationRef.current = operation;
+    setPendingShiftOperation(operation);
+    return true;
+  }
+
+  async function runShiftOperation(operation = pendingShiftOperationRef.current) {
+    if (!operation || writeLock.current) return;
+    writeLock.current = true;
+    setBusy(true); setError(''); setMessage('');
+    try {
+      if (operation.action === 'cash-movement') {
+        const result = await post<CashMovement>('/api/stations/pos/business', {
+          action: 'cash-movement', shiftId: operation.shiftId, movementType: operation.movementType,
+          amount: operation.amount, reason: operation.reason, idempotencyKey: operation.idempotencyKey,
+        });
+        if (!result?.movementId || result.shiftId !== operation.shiftId || result.movementType !== operation.movementType || result.amount !== operation.amount) {
+          throw new ApiError(tr('Cash movement response was incomplete'), 200);
+        }
+        clearShiftOperation();
+        setMovementAmount(''); setMovementReason('');
+        setMessage(`${tr('Cash movement recorded')}: ${result.movementType === 'in' ? tr('Cash in') : tr('Cash out')} ${money(result.amount)} · ${result.reason}`);
+        try { await refreshTerminal(); } catch (reason) { setError(`${tr('Cash movement recorded; drawer refresh failed:')} ${(reason as Error).message}`); }
+      } else {
+        const result = await post<ShiftCloseResult>('/api/stations/pos/business', {
+          action: 'close', shiftId: operation.shiftId, closingCash: operation.closingCash,
+          ...(operation.notes ? { notes: operation.notes } : {}), idempotencyKey: operation.idempotencyKey,
+        });
+        if (result?.status !== 'closed' || result.shiftId !== operation.shiftId || !Number.isSafeInteger(result.expectedCash) || result.closingCash !== operation.closingCash || result.discrepancy !== result.closingCash - result.expectedCash) {
+          throw new ApiError(tr('Shift close response was incomplete'), 200);
+        }
+        clearShiftOperation();
+        setShiftCloseResult(result);
+        setMessage(`${tr('Shift closed')}: ${tr('Expected cash')} ${money(result.expectedCash)} · ${tr('Counted cash')} ${money(result.closingCash)} · ${tr('Variance')} ${result.discrepancy}`);
+        setTerminal(current => current ? { ...current, openShifts: current.openShifts.filter(shift => shift.id !== result.shiftId) } : current);
+        setActiveShiftId(current => current === result.shiftId ? '' : current);
+        try { await refreshTerminal(); } catch (reason) { setError(`${tr('Shift closed; drawer refresh failed:')} ${(reason as Error).message}`); }
+      }
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.outcome === 'not_applied') {
+        clearShiftOperation();
+        setError(reason.message);
+        try { await refreshTerminal(); } catch { /* preserve the definitive rejection */ }
+      } else {
+        pendingShiftOperationRef.current = operation;
+        setPendingShiftOperation(operation);
+        setError(tr('Shift operation outcome is unconfirmed. Retry the exact request with the same key before changing it.'));
+      }
+    } finally {
+      setBusy(false); writeLock.current = false;
+    }
+  }
+
+  function recordCashMovement() {
+    if (!activeShift || !writable || shiftOperationLocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200) return;
+    const operation: ShiftOperation = {
+      action: 'cash-movement', shiftId: activeShift.id, movementType: movementType,
+      amount: parsedMovementAmount, reason: movementReason.trim(), idempotencyKey: `cash-movement-${crypto.randomUUID()}`,
+    };
+    if (saveShiftOperation(operation)) void runShiftOperation(operation);
+  }
+
+  function closeShift() {
+    if (!activeShift || !writable || shiftOperationLocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000) return;
+    const notes = varianceNotes.trim();
+    if (closeDiscrepancyEstimate !== 0 && (!notes || varianceReasonBytes > 200)) return;
+    if (notes && varianceReasonBytes > 200) return;
+    const operation: ShiftOperation = {
+      action: 'close', shiftId: activeShift.id, closingCash: parsedClosingCash,
+      ...(notes ? { notes } : {}), idempotencyKey: `close-${crypto.randomUUID()}`,
+    };
+    if (!window.confirm(`${tr('Confirm shift close')}\n${tr('Counted cash')}: ${money(parsedClosingCash)}\n${tr('Current expected cash (estimate)')}: ${money(expectedDrawerCash)}${closeDiscrepancyEstimate ? `\n${tr('Variance estimate')}: ${money(closeDiscrepancyEstimate)}` : ''}`)) return;
+    if (saveShiftOperation(operation)) void runShiftOperation(operation);
+  }
 
   const readHeldCartPage = useCallback(async (shiftId: string, cursor = '', cartId = '') => {
     const query = new URLSearchParams({ shiftId });
@@ -341,7 +457,7 @@ export function PosCashier({ role }: { role: string }) {
       const register = terminal?.registers.find(entry => entry.id === registerId);
       if (register) setTerminal(current => current ? {
         ...current,
-        openShifts: [...current.openShifts, { id: result.shiftId, registerId, storeId: register.storeId, openingCash: Number(openingCash), openedAt: new Date().toISOString() }],
+        openShifts: [...current.openShifts, { id: result.shiftId, registerId, storeId: register.storeId, openingCash: Number(openingCash), expectedCash: Number(openingCash), openedAt: new Date().toISOString() }],
       } : current);
       try { await refreshTerminal(); } catch (reason) { setError(`${tr('Shift opened; status refresh failed:')} ${(reason as Error).message}`); }
     } catch (reason) {
@@ -463,6 +579,11 @@ export function PosCashier({ role }: { role: string }) {
     {error && <p className="pos-cashier-error" role="alert">{error}</p>}
     {message && <p className="pos-cashier-message" role="status">{message}</p>}
 
+    {pendingShiftOperation && <section className="pos-cashier-panel pos-shift-retry" role="group" aria-label={tr('Unconfirmed shift operation')}>
+      <p>{tr('Shift operation outcome is unconfirmed. Retry the exact request with the same key before changing it.')}</p>
+      <button type="button" onClick={() => void runShiftOperation()} disabled={busy}>{tr('Retry')} {tr(pendingShiftOperation.action === 'close' ? 'close shift' : 'cash movement')}</button>
+    </section>}
+
     {!activeShift && <section className="pos-cashier-panel pos-shift-open" aria-label={tr('Open a cashier shift')}>
       <h2>{tr('Open shift')}</h2>
       <label>{tr('Register')}<select aria-label={tr('Register')} value={registerId} onChange={event => setRegisterId(event.target.value)} disabled={!writable || busy || openShiftUncertain}>
@@ -491,6 +612,32 @@ export function PosCashier({ role }: { role: string }) {
         </li>)}
       </ul>
       {visibleHeldCartsHasMore && <button type="button" className="pos-secondary" onClick={() => void loadMoreHeldCarts(activeShift.id)} disabled={busy || cartOperationUncertain || heldCartsLoading}>{heldCartsLoading ? tr('Loading more held carts') : tr('Load more held carts')}</button>}
+    </section>}
+
+    {activeShift && <section className="pos-drawer-grid" aria-label={tr('Cash drawer')}>
+      <section className="pos-cashier-panel pos-cash-drawer" aria-label={tr('Cash movement')}>
+        <h2>{tr('Cash movement')}</h2>
+        <p className="pos-cashier-note">{tr('Current expected cash (server estimate)')}: <strong>{money(expectedDrawerCash)}</strong></p>
+        <label>{tr('Cash movement type')}<select aria-label={tr('Cash movement type')} value={movementType} onChange={event => setMovementType(event.target.value as 'in' | 'out')} disabled={!writable || busy || shiftOperationLocked}>
+          <option value="in">{tr('Cash in')}</option><option value="out">{tr('Cash out')}</option>
+        </select></label>
+        <label>{tr('Movement amount')}<input aria-label={tr('Movement amount')} inputMode="numeric" type="number" min="1" max={movementMaxAmount} step="1" value={movementAmount} onChange={event => setMovementAmount(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
+        <label>{tr('Movement reason')}<textarea aria-label={tr('Movement reason')} maxLength={200} value={movementReason} onChange={event => setMovementReason(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
+        {movementReasonBytes > 200 && <p className="pos-cashier-error" role="alert">{tr('Reason must be 200 UTF-8 bytes or fewer.')}</p>}
+        <p className="pos-cashier-note">{movementType === 'out' ? `${tr('Cash out available')}: ${money(expectedDrawerCash)}` : tr('Cash in and out amounts are confirmed by the server.')}</p>
+        <button type="button" onClick={recordCashMovement} disabled={!writable || busy || shiftOperationLocked || !Number.isSafeInteger(parsedMovementAmount) || parsedMovementAmount < 1 || parsedMovementAmount > movementMaxAmount || !movementReason.trim() || movementReasonBytes > 200}>{tr('Record cash movement')}</button>
+        {!writable && !shiftOperationLocked && <p className="pos-cashier-note">{tr('Read-only access cannot change the cash drawer.')}</p>}
+      </section>
+      <section className="pos-cashier-panel pos-shift-close" aria-label={tr('Close shift')}>
+        <h2>{tr('Close shift')}</h2>
+        <p className="pos-cashier-note">{tr('Expected cash (server estimate)')}: <strong>{money(expectedDrawerCash)}</strong></p>
+        <label>{tr('Counted closing cash')}<input aria-label={tr('Counted closing cash')} inputMode="numeric" type="number" min="0" max="1000000000" step="1" value={closingCash} onChange={event => setClosingCash(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
+        {closeDiscrepancyEstimate !== null && <p className="pos-cashier-note">{tr('Variance estimate')}: {closeDiscrepancyEstimate < 0 ? tr('Short') : closeDiscrepancyEstimate > 0 ? tr('Over') : tr('Balanced')} {money(Math.abs(closeDiscrepancyEstimate))} · {tr('The server calculates the final variance.')}</p>}
+        <label>{tr('Variance explanation')}<textarea aria-label={tr('Variance explanation')} maxLength={200} value={varianceNotes} onChange={event => setVarianceNotes(event.target.value)} disabled={!writable || busy || shiftOperationLocked}/></label>
+        <button type="button" onClick={closeShift} disabled={!writable || busy || shiftOperationLocked || !Number.isSafeInteger(parsedClosingCash) || parsedClosingCash < 0 || parsedClosingCash > 1000000000 || (closeDiscrepancyEstimate !== 0 && (!varianceNotes.trim() || varianceReasonBytes > 200)) || (!!varianceNotes.trim() && varianceReasonBytes > 200)}>{tr('Review and close shift')}</button>
+        {shiftCloseResult && <div className="pos-receipt"><strong>{tr('Shift closed')}</strong><span>{tr('Expected cash')}: {money(shiftCloseResult.expectedCash)}</span><span>{tr('Counted cash')}: {money(shiftCloseResult.closingCash)}</span><span>{tr('Variance')}: {shiftCloseResult.discrepancy}</span></div>}
+        {!writable && !shiftOperationLocked && <p className="pos-cashier-note">{tr('Read-only access cannot close a shift.')}</p>}
+      </section>
     </section>}
 
     <div className="pos-cashier-grid">

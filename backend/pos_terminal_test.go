@@ -36,6 +36,9 @@ func TestPOSTerminalScopesRegistersAndOpenShifts(t *testing.T) {
 	if len(frontData.Registers) == 0 || len(frontData.OpenShifts) != 1 {
 		t.Fatalf("front terminal registers=%d openShifts=%d", len(frontData.Registers), len(frontData.OpenShifts))
 	}
+	if frontData.OpenShifts[0]["expectedCash"] != frontData.OpenShifts[0]["openingCash"] {
+		t.Fatalf("fresh terminal balance should match opening float: %#v", frontData.OpenShifts[0])
+	}
 	var adminData struct {
 		Registers  []map[string]any `json:"registers"`
 		OpenShifts []map[string]any `json:"openShifts"`

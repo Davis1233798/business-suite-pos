@@ -91,6 +91,7 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('2');
   await expect(page.getByText('Subtotal $200')).toBeVisible();
   await page.getByLabel('Discount Cold brew coffee').fill('10');
+  await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('10');
   await expect(page.locator('.pos-basket li')).toContainText('$190');
   await expect(page.locator('.pos-money-row').nth(1)).toContainText('-$10');
 
@@ -247,6 +248,7 @@ test('cashier holds a discounted basket, claims and releases it, then checks out
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('2');
   await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('10');
   await page.getByLabel('Discount Cold brew coffee').fill('15');
+  await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('15');
   await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeDisabled();
   await page.getByRole('button', { name: 'Save cart changes' }).click();
   await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeDisabled();
@@ -871,6 +873,29 @@ test('cash refund lookup shows closed-shift and non-cash receipts as ineligible'
   expect(requests).toHaveLength(0);
 });
 
+test('cash refund liquidity rejection is localized and releases the corrected refund form', async ({ page }) => {
+  let lookupCount = 0;
+  await page.route('**/api/stations/pos/refund-lookup?**', route => { lookupCount++; return route.fulfill({ json: { success: true, data: refundSale } }); });
+  let submitted: Record<string, any> | undefined;
+  await page.route('**/api/stations/pos/business', route => {
+    submitted = route.request().postDataJSON();
+    return route.fulfill({ status: 409, json: { success: false, error: { message: 'Cash refund exceeds the current expected drawer balance', outcome: 'not_applied' } } });
+  });
+  await posBackOffice(page, 'admin', 'back', 'zh-TW');
+  await page.getByLabel('收據號碼').fill('POS-REFUND-001');
+  await page.getByRole('button', { name: '查詢收據' }).click();
+  await page.getByLabel('退款原因').fill('現金不足');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '確認退款內容' }).click();
+  await expect(page.getByRole('alert')).toContainText('現金退款金額超過收銀抽屜目前的預期現金餘額');
+  await expect(page.getByRole('button', { name: '重試退款' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '確認退款內容' })).toBeEnabled();
+  await expect(page.getByLabel('退款原因')).toHaveValue('現金不足');
+  expect(submitted).toMatchObject({ action: 'refund', saleLineId: 'line-a', quantity: 1, reason: '現金不足' });
+  expect(lookupCount).toBe(2);
+  expect(await page.evaluate(() => Object.keys(sessionStorage).filter(key => key.startsWith('pos-refund-pending:')))).toEqual([]);
+});
+
 test('ambiguous refund retries the exact payload and idempotency key', async ({ page }) => {
   await page.route('**/api/stations/pos/refund-lookup?**', route => route.fulfill({ json: { success: true, data: refundSale } }));
   const refundRequests: Record<string, any>[] = [];
@@ -1164,4 +1189,256 @@ test('definitive no-effect validation releases a persisted UTF-8-overlong reason
   await expect(page.getByRole('button', { name: 'Review refund' })).toBeEnabled();
   expect(sent).toMatchObject({ saleLineId: 'line-a', quantity: 1, reason: longReason, idempotencyKey: attempt.idempotencyKey });
   expect(await page.evaluate(key => sessionStorage.getItem(key), `pos-refund-pending:${encodeURIComponent(ownerKey)}`)).toBeNull();
+});
+
+const openCashShift = { id: 'shift-cash-a', registerId: register.id, storeId: register.storeId, openingCash: 1000, expectedCash: 1000, openedAt: '2026-11-15T09:00:00Z' };
+
+test('cashier records cash in and out then closes against the server counted variance', async ({ page }) => {
+  let closed = false, expectedCash = 1000;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: closed ? [] : [{ ...openCashShift, expectedCash }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (body.action === 'cash-movement') {
+      expect(body).toMatchObject({ shiftId: openCashShift.id, action: 'cash-movement' });
+      expect(body.amount).toBeGreaterThan(0);
+      expect(body.idempotencyKey).toEqual(expect.any(String));
+      expectedCash += body.movementType === 'in' ? body.amount : -body.amount;
+      await route.fulfill({ json: { success: true, data: { movementId: `movement-${requests.length}`, shiftId: openCashShift.id, movementType: body.movementType, amount: body.amount, reason: body.reason } } });
+      return;
+    }
+    expect(body).toMatchObject({ action: 'close', shiftId: openCashShift.id, closingCash: 1135, notes: 'Cash short after drawer count' });
+    expect(body).not.toHaveProperty('expectedCash');
+    closed = true;
+    await route.fulfill({ json: { success: true, data: { shiftId: openCashShift.id, status: 'closed', expectedCash: 1145, closingCash: 1135, discrepancy: -10 } } });
+  });
+  await cashier(page);
+  await expect(page.getByRole('region', { name: 'Cash movement' })).toBeVisible();
+  await page.getByLabel('Cash movement type').selectOption('in');
+  await page.getByLabel('Movement amount').fill('20');
+  await page.getByLabel('Movement reason').fill('Float top-up');
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cash movement recorded' })).toBeVisible();
+  await page.getByLabel('Cash movement type').selectOption('out');
+  await page.getByLabel('Movement amount').fill('15');
+  await page.getByLabel('Movement reason').fill('Safe drop');
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cash movement recorded' })).toBeVisible();
+  await page.getByLabel('Counted closing cash').fill('1135');
+  await page.getByLabel('Variance explanation').fill('Cash short after drawer count');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review and close shift' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Shift closed' })).toContainText('1,145');
+  await expect(page.getByRole('status').filter({ hasText: 'Shift closed' })).toContainText('-10');
+  expect(requests.map(request => request.action)).toEqual(['cash-movement', 'cash-movement', 'close']);
+  expect(requests[0]).toMatchObject({ movementType: 'in', amount: 20, reason: 'Float top-up' });
+  expect(requests[1]).toMatchObject({ movementType: 'out', amount: 15, reason: 'Safe drop' });
+});
+
+test('ambiguous cash movement keeps and retries the exact request after reload', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    requests.push(route.request().postDataJSON());
+    if (requests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Cash movement outcome is unconfirmed' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { movementId: 'movement-recovered', shiftId: openCashShift.id, movementType: 'in', amount: 25, reason: 'Float top-up' } } });
+  });
+  await cashier(page);
+  await page.getByLabel('Cash movement type').selectOption('in');
+  await page.getByLabel('Movement amount').fill('25');
+  await page.getByLabel('Movement reason').fill('Float top-up');
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('button', { name: 'Retry cash movement' })).toBeVisible();
+  const original = requests[0];
+  await expect(page.getByLabel('Movement reason')).toBeDisabled();
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry cash movement' })).toBeVisible();
+  await expect(page.getByLabel('Movement amount')).toHaveValue('25');
+  await expect(page.getByLabel('Movement reason')).toHaveValue('Float top-up');
+  await page.getByRole('button', { name: 'Retry cash movement' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cash movement recorded' })).toContainText('25');
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toEqual(original);
+});
+
+test('definitive cash-out rejection clears the saved attempt before a corrected request', async ({ page }) => {
+  // Terminal showed 30, but a concurrent drawer change leaves only 20 by the time the server validates.
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [{ ...openCashShift, openingCash: 30, expectedCash: 30 }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      await route.fulfill({ status: 409, json: { success: false, error: { message: 'Cash out exceeds the available drawer balance', outcome: 'not_applied' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { movementId: 'movement-corrected', shiftId: openCashShift.id, movementType: 'out', amount: 20, reason: 'Safe drop' } } });
+  });
+  await cashier(page);
+  await page.getByLabel('Cash movement type').selectOption('out');
+  await page.getByLabel('Movement amount').fill('30');
+  await page.getByLabel('Movement reason').fill('Safe drop');
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('alert')).toContainText('exceeds the available drawer balance');
+  await expect(page.getByRole('button', { name: 'Retry cash movement' })).toHaveCount(0);
+  await expect(page.getByLabel('Movement amount')).toBeEnabled();
+  await expect(page.getByLabel('Movement amount')).toHaveValue('30');
+  await page.getByLabel('Movement amount').fill('20');
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cash movement recorded' })).toBeVisible();
+  expect(requests).toHaveLength(2);
+  expect(requests[0].idempotencyKey).not.toBe(requests[1].idempotencyKey);
+  expect(requests[0]).toMatchObject({ movementType: 'out', amount: 30, reason: 'Safe drop' });
+  expect(requests[1]).toMatchObject({ movementType: 'out', amount: 20, reason: 'Safe drop' });
+});
+
+test('negative legacy drawer balance can be repaired with cash in while cash out is blocked', async ({ page }) => {
+  let expectedCash = -20;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [{ ...openCashShift, openingCash: 0, expectedCash }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    expectedCash += body.amount;
+    await route.fulfill({ json: { success: true, data: { movementId: 'movement-repair', shiftId: openCashShift.id, movementType: body.movementType, amount: body.amount, reason: body.reason } } });
+  });
+  await cashier(page);
+  await expect(page.getByRole('region', { name: 'Cash drawer' })).toContainText('-NT$20');
+  await page.getByLabel('Cash movement type').selectOption('out');
+  await page.getByLabel('Movement amount').fill('1');
+  await page.getByLabel('Movement reason').fill('Correct negative balance');
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeDisabled();
+  await page.getByLabel('Cash movement type').selectOption('in');
+  await page.getByLabel('Movement amount').fill('20');
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Record cash movement' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Cash movement recorded' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Cash drawer' })).toContainText('NT$0');
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({ action: 'cash-movement', movementType: 'in', amount: 20, reason: 'Correct negative balance' });
+});
+
+test('ambiguous shift close replays the same counted cash and key after reload', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    requests.push(route.request().postDataJSON());
+    if (requests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Close outcome is unconfirmed' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { shiftId: openCashShift.id, status: 'closed', expectedCash: 1000, closingCash: 990, discrepancy: -10 } } });
+  });
+  await cashier(page);
+  await page.getByLabel('Counted closing cash').fill('990');
+  await page.getByLabel('Variance explanation').fill('Counted drawer is short');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review and close shift' }).click();
+  await expect(page.getByRole('button', { name: 'Retry close shift' })).toBeVisible();
+  const original = requests[0];
+  await expect(page.getByLabel('Counted closing cash')).toBeDisabled();
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry close shift' })).toBeVisible();
+  await expect(page.getByLabel('Counted closing cash')).toHaveValue('990');
+  await page.getByRole('button', { name: 'Retry close shift' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Shift closed' })).toContainText('-10');
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toEqual(original);
+});
+
+test('persisted invalid close retry is released by a definitive rejection before corrected close', async ({ page }) => {
+  const ownerKey = 'org-a:cashier-a';
+  const oldAttempt = { action: 'close', shiftId: openCashShift.id, closingCash: 1000000001, notes: 'Old invalid count', idempotencyKey: 'close-invalid-count-key' };
+  await page.addInitScript(({ key, value }) => sessionStorage.setItem(key, JSON.stringify(value)), { key: `pos-shift-operation:${encodeURIComponent(ownerKey)}`, value: oldAttempt });
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      await route.fulfill({ status: 400, json: { success: false, error: { message: 'Closing cash must be within allowed bounds', outcome: 'not_applied' } } });
+      return;
+    }
+    await route.fulfill({ json: { success: true, data: { shiftId: openCashShift.id, status: 'closed', expectedCash: 1000, closingCash: 1000, discrepancy: 0 } } });
+  });
+  await cashier(page);
+  await expect(page.getByRole('button', { name: 'Retry close shift' })).toBeVisible();
+  await expect(page.getByLabel('Counted closing cash')).toHaveValue('1000000001');
+  await page.getByRole('button', { name: 'Retry close shift' }).click();
+  await expect(page.getByRole('alert')).toContainText('Closing cash must be within allowed bounds');
+  await expect(page.getByRole('button', { name: 'Retry close shift' })).toHaveCount(0);
+  expect(await page.evaluate(key => sessionStorage.getItem(key), `pos-shift-operation:${encodeURIComponent(ownerKey)}`)).toBeNull();
+  await expect(page.getByLabel('Counted closing cash')).toBeEnabled();
+  await page.getByLabel('Counted closing cash').fill('1000');
+  await page.getByLabel('Variance explanation').fill('');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Review and close shift' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Shift closed' })).toContainText('Variance 0');
+  expect(requests).toHaveLength(2);
+  expect(requests[0].idempotencyKey).toBe(oldAttempt.idempotencyKey);
+  expect(requests[1].idempotencyKey).not.toBe(requests[0].idempotencyKey);
+  expect(requests[1]).toMatchObject({ action: 'close', closingCash: 1000 });
+});
+
+test('read-only cashier cannot record cash movements or close an open shift', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  await cashier(page, 'readonly');
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  await expect(page.getByLabel('Movement amount')).toBeDisabled();
+  await expect(page.getByLabel('Counted closing cash')).toBeDisabled();
+});
+
+test('zero-balance shift still requires an explicit counted cash value', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [{ ...openCashShift, openingCash: 0, expectedCash: 0 }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', route => { requests.push(route.request().postDataJSON()); return route.fulfill({ status: 503, json: { success: false, error: { message: 'Unexpected request' } } }); });
+  await cashier(page);
+  await expect(page.getByLabel('Counted closing cash')).toHaveValue('');
+  await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
+  expect(requests).toHaveLength(0);
+});
+
+test('cash movement rejects zero, over-limit, blank, and UTF-8-overlong values before submit', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/business', route => { requests.push(route.request().postDataJSON()); return route.fulfill({ status: 503, json: { success: false, error: { message: 'Invalid request' } } }); });
+  await cashier(page);
+  const amount = page.getByLabel('Movement amount');
+  await amount.fill('0');
+  await page.getByLabel('Movement reason').fill('reason');
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeDisabled();
+  await amount.fill('1000000001');
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeDisabled();
+  await amount.fill('10');
+  await page.getByLabel('Movement reason').fill('中'.repeat(67));
+  await expect(page.getByText('Reason must be 200 UTF-8 bytes or fewer.')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeDisabled();
+  await page.getByLabel('Movement reason').fill('中'.repeat(66));
+  await expect(page.getByRole('button', { name: 'Record cash movement' })).toBeEnabled();
+  expect(requests).toHaveLength(0);
+});
+
+test('shift close and drawer controls show localized labels and server-final short variance', async ({ page }) => {
+  await page.addInitScript(() => localStorage.setItem('suite-language', 'zh-TW'));
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [openCashShift] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  await page.route('**/api/stations/pos/business', route => route.fulfill({ json: { success: true, data: { shiftId: openCashShift.id, status: 'closed', expectedCash: 1000, closingCash: 990, discrepancy: -10 } } }));
+  await cashier(page, 'operator', 'front', 'zh-TW');
+  await expect(page.getByLabel('現金異動')).toBeVisible();
+  await expect(page.getByLabel('交班實點現金')).toBeVisible();
+  await page.getByLabel('交班實點現金').fill('990');
+  await page.getByLabel('差異說明').fill('點鈔短少');
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: '確認交班' }).click();
+  await expect(page.getByRole('status').filter({ hasText: '班次已結束' })).toContainText('-10');
 });
