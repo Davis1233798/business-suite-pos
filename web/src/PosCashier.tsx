@@ -106,7 +106,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const [heldCartsNextCursor, setHeldCartsNextCursor] = useState('');
   const [cartName, setCartName] = useState(() => pendingCheckout?.cartName || pendingHeldOperation?.cartNameSnapshot || '');
   const [claimedCartId, setClaimedCartId] = useState(() => pendingCheckout?.claimedCartId || pendingHeldOperation?.claimedCartIdSnapshot || '');
-  const [heldCartDirty, setHeldCartDirty] = useState(false);
+  const [heldCartDirty, setHeldCartDirty] = useState(() => pendingHeldOperation?.action === 'update');
   const [cartOperationUncertain, setCartOperationUncertain] = useState(() => pendingHeldOperation !== null);
   const [cartOperationAction, setCartOperationAction] = useState<HeldOperation['action'] | ''>(() => pendingHeldOperation?.action || '');
   const [error, setError] = useState('');
@@ -415,7 +415,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         }
         if (operation.action === 'claim' && reason instanceof ApiError && reason.status === 409) {
           try { await refreshHeldCarts(String(operation.body.shiftId || '')); } catch { /* keep the conflict visible */ }
-          setError(tr('Another cashier claimed this cart. The held list was refreshed.'));
+          setError(tr('This cart is unavailable. Check the shift status and refresh the held list.'));
         } else {
           setError((reason as Error).message);
         }

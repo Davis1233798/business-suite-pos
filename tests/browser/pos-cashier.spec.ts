@@ -390,7 +390,8 @@ test('claim conflict refreshes the held list and never restores or checks out an
   });
   await cashier(page);
   await page.getByRole('button', { name: 'Claim Competing basket' }).click();
-  await expect(page.getByRole('alert')).toContainText('Another cashier claimed');
+  await expect(page.getByRole('alert')).toContainText('This cart is unavailable');
+  await expect(page.getByRole('alert')).not.toContainText('Another cashier');
   await expect(page.getByText('Competing basket')).toHaveCount(0);
   await expect(page.locator('.pos-basket li')).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeDisabled();
@@ -398,6 +399,95 @@ test('claim conflict refreshes the held list and never restores or checks out an
   expect(actions).toHaveLength(1);
   expect(actions[0]).toMatchObject({ action: 'claim', shiftId: 'shift-a', cartId: 'cart-race' });
   await expect(page.getByLabel('Cash tendered')).toBeEmpty();
+});
+
+test('closed-shift claim rejection is neutral and a new same-store shift can recover carts', async ({ page }) => {
+  const claimedCart = { cartId: 'cart-closed-claim', cartName: 'Closed shift cart', heldAt: '2026-11-15T10:00:00Z', lines: [
+    { itemId: product.id, quantity: 1, discountAmount: 0, available: true, product },
+  ] };
+  const retrievedCart = { cartId: 'cart-closed-retrieved', cartName: 'Prior retrieved cart', heldAt: '2026-11-15T09:00:00Z', lines: [
+    { itemId: product.id, quantity: 1, discountAmount: 5, available: true, product },
+  ] };
+  let shiftState: 'old-open' | 'closed' | 'new-open' = 'old-open';
+  let claimed = false;
+  let released = false;
+  let discarded = false;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
+    registers: [register], openShifts: shiftState === 'old-open' ? [{ ...openCashShift }] : shiftState === 'new-open' ? [{ ...openCashShift, id: 'shift-new' }] : [],
+  } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => {
+    const url = new URL(route.request().url());
+    const shiftId = url.searchParams.get('shiftId');
+    const cartId = url.searchParams.get('cartId');
+    if (shiftId === openCashShift.id && shiftState === 'closed') {
+      return route.fulfill({ status: 404, json: { success: false, error: { message: 'Open shift not found' } } });
+    }
+    if (cartId === claimedCart.cartId) {
+      return route.fulfill({ json: { success: true, data: { items: [{ ...claimedCart, status: 'retrieved' }], hasMore: false, nextCursor: '' } } });
+    }
+    const rows = [];
+    if (!released && !discarded) rows.push({ ...claimedCart, status: claimed ? 'retrieved' : 'held' });
+    if (!discarded) rows.push({ ...retrievedCart, status: 'retrieved' });
+    return route.fulfill({ json: { success: true, data: { items: rows, hasMore: false, nextCursor: '' } } });
+  });
+  await page.route('**/api/stations/pos/business', async route => {
+    const body = route.request().postDataJSON();
+    expect(body.action).toBe('open');
+    shiftState = 'new-open';
+    await route.fulfill({ json: { success: true, data: { shiftId: 'shift-new', status: 'open' } } });
+  });
+  const operations: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); operations.push(body);
+    if (body.action === 'claim' && body.cartId === claimedCart.cartId && shiftState === 'old-open') {
+      shiftState = 'closed';
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Claim result is unconfirmed' } } });
+    } else if (body.action === 'claim' && body.cartId === claimedCart.cartId && shiftState === 'closed') {
+      await route.fulfill({ status: 409, json: { success: false, error: { message: 'Shift is not open', outcome: 'not_applied' } } });
+    } else if (body.action === 'claim') {
+      claimed = true;
+      await route.fulfill({ json: { success: true, data: { cartId: body.cartId, status: 'retrieved' } } });
+    } else if (body.action === 'release') {
+      released = true;
+      await route.fulfill({ json: { success: true, data: { cartId: body.cartId, status: 'held' } } });
+    } else if (body.action === 'discard') {
+      discarded = true;
+      await route.fulfill({ json: { success: true, data: { cartId: body.cartId, status: 'cancelled' } } });
+    } else throw new Error(`Unexpected action ${body.action}`);
+  });
+
+  await cashier(page);
+  await page.getByRole('button', { name: `Claim ${claimedCart.cartName}` }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Retry claim' })).toBeVisible();
+  await page.getByRole('button', { name: 'Retry claim' }).click();
+  await expect(page.getByRole('alert')).toContainText('This cart is unavailable');
+  await expect(page.getByRole('alert')).not.toContainText('Another cashier');
+  await expect(page.getByText('No open shift')).toBeVisible();
+
+  await page.getByLabel('Register').selectOption(register.id);
+  await page.getByLabel('Opening cash').fill('1000');
+  await page.getByRole('button', { name: 'Open shift' }).click();
+  await expect(page.getByText('Shift open · shift-new')).toBeVisible();
+  await expect(page.getByRole('button', { name: `Claim ${claimedCart.cartName}` })).toBeVisible();
+  await expect(page.getByRole('button', { name: `Resume ${retrievedCart.cartName}` })).toBeVisible();
+
+  await page.getByRole('button', { name: `Claim ${claimedCart.cartName}` }).click();
+  await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('1');
+  await page.getByRole('button', { name: 'Release held cart' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Basket released' })).toBeVisible();
+
+  await page.getByRole('button', { name: `Resume ${retrievedCart.cartName}` }).click();
+  await page.getByRole('button', { name: 'Remove Cold brew coffee' }).click();
+  page.once('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Discard held cart' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Held cart discarded' })).toBeVisible();
+  expect(operations.map(operation => operation.action)).toEqual(['claim', 'claim', 'claim', 'release', 'discard']);
+  expect(operations[0]).toEqual(operations[1]);
+  expect(operations[2].shiftId).toBe('shift-new');
+  expect(operations[3].shiftId).toBe('shift-new');
+  expect(operations[4].shiftId).toBe('shift-new');
 });
 
 test('ambiguous hold retries the exact named discounted basket with the same idempotency key', async ({ page }) => {
@@ -744,6 +834,62 @@ test('held-cart price decrease blocks checkout until the cashier corrects and sa
   expect(checkedOut).toBe(true);
   expect(updates).toHaveLength(1);
   expect(updates[0]).toMatchObject({ action: 'update', cartId: 'cart-repriced', lines: [{ itemId: product.id, quantity: 1, discountAmount: 5 }] });
+});
+
+test('recovered held-cart update rejection keeps staged lines dirty until a new update succeeds', async ({ page }) => {
+  const persistedDiscount = { value: 0 };
+  let claimed = false;
+  const held = () => ({ cartId: 'cart-update-recovery', cartName: 'Update recovery', heldAt: '2026-11-15T10:00:00Z', status: claimed ? 'retrieved' : 'held', lines: [
+    { itemId: product.id, quantity: 1, discountAmount: persistedDiscount.value, available: true, product },
+  ] });
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [{ ...openCashShift }] } } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [held()], hasMore: false, nextCursor: '' } } }));
+  const cartRequests: Record<string, any>[] = [];
+  let updates = 0;
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); cartRequests.push(body);
+    if (body.action === 'claim') {
+      claimed = true;
+      await route.fulfill({ json: { success: true, data: { cartId: body.cartId, status: 'retrieved' } } });
+    } else if (body.action === 'update') {
+      updates++;
+      if (updates === 1) {
+        await route.fulfill({ status: 503, json: { success: false, error: { message: 'Update outcome is unconfirmed' } } });
+      } else if (updates === 2) {
+        await route.fulfill({ status: 409, json: { success: false, error: { message: 'Cart changed', outcome: 'not_applied' } } });
+      } else {
+        persistedDiscount.value = 10;
+        await route.fulfill({ json: { success: true, data: { cartId: body.cartId, status: 'retrieved' } } });
+      }
+    } else {
+      await route.fulfill({ json: { success: true, data: {
+        saleId: 'sale-update-recovery', receiptNumber: 'POS-UPDATE-RECOVERY', subtotal: 100,
+        discountAmount: persistedDiscount.value, totalAmount: 100 - persistedDiscount.value, changeAmount: 0,
+      } } });
+    }
+  });
+  await cashier(page);
+  await page.getByRole('button', { name: 'Claim Update recovery' }).click();
+  await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('0');
+  await page.getByLabel('Discount Cold brew coffee').fill('10');
+  await expect(page.getByRole('button', { name: 'Save cart changes' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Save cart changes' }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await page.reload();
+  await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('10');
+  await page.getByRole('button', { name: 'Retry update' }).click();
+  await expect(page.getByRole('alert')).toContainText('Cart changed');
+  await page.getByLabel('Cash tendered').fill('100');
+  await expect(page.getByRole('button', { name: 'Save cart changes' })).toBeEnabled();
+  await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeDisabled();
+  expect(cartRequests[2]).toEqual(cartRequests[1]);
+
+  await page.getByRole('button', { name: 'Save cart changes' }).click();
+  await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeEnabled();
+  expect(cartRequests[3].idempotencyKey).not.toBe(cartRequests[1].idempotencyKey);
+  await page.getByRole('button', { name: 'Complete cash sale' }).click();
+  await expect(page.getByText('POS-UPDATE-RECOVERY')).toBeVisible();
+  expect(cartRequests[4]).toMatchObject({ action: 'checkout', cartId: 'cart-update-recovery' });
 });
 
 test('held checkout validation refreshes current item details without changing the persisted line snapshot', async ({ page }) => {

@@ -302,7 +302,7 @@ const traditionalChinese:Record<string,string> = {
   "Basket released": "掛單已釋出",
   "Retrieved cart": "已取回掛單",
   "Cart claimed, but its items must be refreshed before use.": "掛單已取回，但商品必須重新整理後才能使用。",
-  "Another cashier claimed this cart. The held list was refreshed.": "此掛單已由其他收銀員取回。掛單清單已重新整理。",
+  "This cart is unavailable. Check the shift status and refresh the held list.": "此掛單目前無法使用。請確認班次狀態並重新整理掛單清單。",
   "Accounts": "客戶帳戶",
   "Contacts": "聯絡人",
   "Leads": "潛在客戶",
