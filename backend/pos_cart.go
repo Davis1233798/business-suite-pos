@@ -9,8 +9,9 @@ import (
 )
 
 type posCartLine struct {
-	ItemID   string `json:"itemId"`
-	Quantity int64  `json:"quantity"`
+	ItemID         string `json:"itemId"`
+	Quantity       int64  `json:"quantity"`
+	DiscountAmount int64  `json:"discountAmount,omitempty"`
 }
 type posCartRequest struct {
 	Action   string        `json:"action"`
@@ -150,10 +151,10 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		type resolved struct {
 			posCartLine
 			barcode, name string
-			price         int64
+			price, gross  int64
 		}
 		resolvedLines := []resolved{}
-		var total int64
+		var subtotal, discountTotal int64
 		for _, line := range lines {
 			if line.ItemID == "" || len(line.ItemID) > 256 || line.Quantity < 1 || line.Quantity > 1000 || seen[line.ItemID] {
 				fail(w, 400, "Invalid or duplicate cart item")
@@ -171,17 +172,24 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 				fail(w, 503, "Cannot read product")
 				return
 			}
-			if price < 0 || price > 1000000 || total > 1000000000-price*line.Quantity {
+			if price < 0 || price > 1000000 || subtotal > 1000000000-price*line.Quantity {
 				fail(w, 400, "Invalid cart total")
+				return
+			}
+			gross := price * line.Quantity
+			if line.DiscountAmount < 0 || line.DiscountAmount > gross {
+				fail(w, 400, "Invalid line discount")
 				return
 			}
 			if in.Action == "checkout" && stock < line.Quantity {
 				fail(w, 409, "Insufficient stock")
 				return
 			}
-			total += price * line.Quantity
-			resolvedLines = append(resolvedLines, resolved{line, barcode, name, price})
+			subtotal += gross
+			discountTotal += line.DiscountAmount
+			resolvedLines = append(resolvedLines, resolved{line, barcode, name, price, gross})
 		}
+		total := subtotal - discountTotal
 		if in.Action == "hold" {
 			encoded, _ := json.Marshal(lines)
 			entity = "cart_" + token()
@@ -194,7 +202,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			}
 			entity = "sale_" + token()
 			receipt := "POS-" + strings.ToUpper(token()[:12])
-			_, e = tx.Exec("INSERT INTO pos_sales(id,organization_id,receipt_number,store_id,register_id,shift_id,cashier_id,subtotal,total_amount,tender_amount,change_amount,payment_method,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,'cash','completed',?)", entity, id.OrganizationID, receipt, store, register, in.ShiftID, id.UserID, total, total, in.Tender, in.Tender-total, in.Key)
+			_, e = tx.Exec("INSERT INTO pos_sales(id,organization_id,receipt_number,store_id,register_id,shift_id,cashier_id,subtotal,discount_amount,total_amount,tender_amount,change_amount,payment_method,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'cash','completed',?)", entity, id.OrganizationID, receipt, store, register, in.ShiftID, id.UserID, subtotal, discountTotal, total, in.Tender, in.Tender-total, in.Key)
 			for _, line := range resolvedLines {
 				if e != nil {
 					break
@@ -210,13 +218,13 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 					}
 				}
 				if e == nil {
-					_, e = tx.Exec("INSERT INTO pos_sale_lines(id,organization_id,sale_id,item_id,barcode,name,unit_price,quantity,line_total) VALUES(?,?,?,?,?,?,?,?,?)", "sale_line_"+token(), id.OrganizationID, entity, line.ItemID, line.barcode, line.name, line.price, line.Quantity, line.price*line.Quantity)
+					_, e = tx.Exec("INSERT INTO pos_sale_lines(id,organization_id,sale_id,item_id,barcode,name,unit_price,quantity,discount_amount,line_total) VALUES(?,?,?,?,?,?,?,?,?,?)", "sale_line_"+token(), id.OrganizationID, entity, line.ItemID, line.barcode, line.name, line.price, line.Quantity, line.DiscountAmount, line.gross-line.DiscountAmount)
 				}
 			}
 			if e == nil && in.CartID != "" {
 				_, e = tx.Exec("UPDATE pos_held_carts SET status='completed' WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
 			}
-			result = map[string]any{"saleId": entity, "receiptNumber": receipt, "totalAmount": total, "changeAmount": in.Tender - total}
+			result = map[string]any{"saleId": entity, "receiptNumber": receipt, "subtotal": subtotal, "discountAmount": discountTotal, "totalAmount": total, "changeAmount": in.Tender - total}
 		}
 	}
 	if e != nil {

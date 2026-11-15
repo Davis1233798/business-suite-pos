@@ -1,5 +1,11 @@
 # 實作狀態：2026-10-30
 
+## POS 收銀 UI 增量：2026-11-15
+
+新增 `/pos/front` 收銀垂直切片：限定範圍終端資料、開班、條碼掃描、數量與固定單行折讓、現金結帳及伺服器回傳收據。開班與結帳遇不確定結果時鎖住輸入並用原冪等鍵重試；唯讀角色不能寫入。收銀頁不載入通用 `pos/data?view=front` 資料集。此交付不代表 P01–P08 整體驗收或正式部署。
+
+本次驗證：`npm run go:test`、`npm test`、`npx playwright test --config playwright.cashier.config.ts`（3/3）、`npm run web:build`、`npx eslint web/src/PosCashier.tsx` 與 `git diff --check` 通過。`web/src/main.tsx` 全檔 ESLint 仍有既存錯誤，新增路由段沒有 lint 診斷。尚未設計折讓原因、主管核准、促銷規則或折讓上限；完整端到端 P01–P08、離線交易、多工作站競爭及生產部署仍未完成／驗證。細節見 `docs/engineering/POS_CASHIER_UI.md` 與 `docs/engineering/POS_CART_LINE_DISCOUNTS.md`。
+
 本次由目前 Codex 主代理與三個同模型子代理完成整合，未使用不可用的指定替代模型。
 
 已實作個人作品首頁、MES、ERP、POS、CRM、餐飲與電商前後台；使用真正 D1 持久化、訪客展示空間、模擬角色、原子庫存／付款／報工交易、種子重置、完整業務備份還原及 CSV。
