@@ -33,27 +33,11 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		return
 	}
 	var in posCartRequest
-	if body(r, &in) != nil || len(in.Key) < 8 || len(in.Key) > 128 || in.ShiftID == "" || len(in.ShiftID) > 256 || len(in.CartID) > 256 || in.Tender < 0 || in.Tender > 1000000000 || (in.Action != "hold" && in.Action != "claim" && in.Action != "release" && in.Action != "update" && in.Action != "discard" && in.Action != "checkout") {
+	if body(r, &in) != nil || len(in.Key) < 8 || len(in.Key) > 128 || (in.Action != "hold" && in.Action != "claim" && in.Action != "release" && in.Action != "update" && in.Action != "discard" && in.Action != "checkout") {
 		fail(w, 400, "Invalid cart request")
 		return
 	}
 	in.CartName = strings.TrimSpace(in.CartName)
-	if in.Action == "hold" && (in.CartName == "" || len(in.CartName) > 100 || len(in.Lines) == 0 || len(in.Lines) > 100) {
-		fail(w, 400, "Enter a cart name and items")
-		return
-	}
-	if (in.Action == "claim" || in.Action == "release" || in.Action == "update" || in.Action == "discard") && in.CartID == "" {
-		fail(w, 400, "Select a cart")
-		return
-	}
-	if in.Action == "update" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
-		fail(w, 400, "Cart must contain 1 to 100 items")
-		return
-	}
-	if in.Action == "checkout" && in.CartID == "" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
-		fail(w, 400, "Add items to the sale")
-		return
-	}
 	tx, e := a.db.BeginTx(r.Context(), nil)
 	if e != nil {
 		fail(w, 503, "POS unavailable")
@@ -64,7 +48,8 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 	hash := digest(id.UserID + "\x00" + string(raw))
 	endpoint := "/station/pos/cart/" + in.Action
 	var oldHash, oldBody string
-	e = tx.QueryRow("SELECT request_hash,response_body FROM idempotency_keys WHERE organization_id=? AND key=? AND endpoint=?", id.OrganizationID, in.Key, endpoint).Scan(&oldHash, &oldBody)
+	var oldStatus int
+	e = tx.QueryRow("SELECT request_hash,response_status,response_body FROM idempotency_keys WHERE organization_id=? AND key=? AND endpoint=?", id.OrganizationID, in.Key, endpoint).Scan(&oldHash, &oldStatus, &oldBody)
 	if e == nil {
 		if hash != oldHash {
 			fail(w, 409, "Retry key already used")
@@ -75,6 +60,10 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			fail(w, 500, "Invalid retry result")
 			return
 		}
+		if oldStatus != http.StatusOK {
+			writeJSON(w, oldStatus, result)
+			return
+		}
 		ok(w, result)
 		return
 	}
@@ -82,22 +71,43 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		fail(w, 503, "Cannot read retry state")
 		return
 	}
+	if in.ShiftID == "" || len(in.ShiftID) > 256 || len(in.CartID) > 256 || in.Tender < 0 || in.Tender > 1000000000 {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Invalid cart request")
+		return
+	}
+	if in.Action == "hold" && (in.CartName == "" || len(in.CartName) > 100 || len(in.Lines) == 0 || len(in.Lines) > 100) {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Enter a cart name and items")
+		return
+	}
+	if (in.Action == "claim" || in.Action == "release" || in.Action == "update" || in.Action == "discard") && in.CartID == "" {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Select a cart")
+		return
+	}
+	if in.Action == "update" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Cart must contain 1 to 100 items")
+		return
+	}
+	if in.Action == "checkout" && in.CartID == "" && (len(in.Lines) == 0 || len(in.Lines) > 100) {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Add items to the sale")
+		return
+	}
 	var store, register, cashier, status string
 	e = tx.QueryRow("SELECT store_id,register_id,cashier_id,status FROM pos_shifts WHERE organization_id=? AND id=?", id.OrganizationID, in.ShiftID).Scan(&store, &register, &cashier, &status)
 	if errors.Is(e, sql.ErrNoRows) {
-		fail(w, 404, "Shift not found")
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusNotFound, "Shift not found")
 		return
 	}
 	if e != nil {
 		fail(w, 503, "Cannot read shift")
 		return
 	}
-	if status != "open" {
-		fail(w, 409, "Shift is not open")
+	closedShiftRecovery := status == "closed" && (in.Action == "release" || in.Action == "discard")
+	if status != "open" && !closedShiftRecovery {
+		terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Shift is not open")
 		return
 	}
 	if cashier != id.UserID && g.Role != "admin" {
-		fail(w, 403, "Cannot use another cashier's shift")
+		fail(w, http.StatusForbidden, "Cannot access this shift")
 		return
 	}
 	entity := ""
@@ -107,7 +117,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		var cartStore, cartStatus, locked, stored string
 		e = tx.QueryRow("SELECT store_id,status,COALESCE(locked_by,''),items_json FROM pos_held_carts WHERE organization_id=? AND id=?", id.OrganizationID, in.CartID).Scan(&cartStore, &cartStatus, &locked, &stored)
 		if errors.Is(e, sql.ErrNoRows) {
-			fail(w, 404, "Cart not found")
+			terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusNotFound, "Cart not found")
 			return
 		}
 		if e != nil {
@@ -115,35 +125,65 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			return
 		}
 		if cartStore != store {
-			fail(w, 403, "Cart belongs to another store")
+			fail(w, http.StatusForbidden, "Cannot access this cart")
 			return
 		}
 		entity = in.CartID
 		if in.Action == "claim" {
 			if cartStatus != "held" {
-				fail(w, 409, "Cart has already been claimed")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 				return
 			}
-			_, e = tx.Exec("UPDATE pos_held_carts SET status='retrieved',locked_by=? WHERE organization_id=? AND id=? AND status='held'", id.UserID, id.OrganizationID, in.CartID)
+			var claimed sql.Result
+			claimed, e = tx.Exec("UPDATE pos_held_carts SET status='retrieved',locked_by=? WHERE organization_id=? AND id=? AND status='held'", id.UserID, id.OrganizationID, in.CartID)
+			if e == nil {
+				var n int64
+				n, e = claimed.RowsAffected()
+				if e == nil && n != 1 {
+					terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+					return
+				}
+			}
 			result = map[string]any{"cartId": entity, "status": "retrieved"}
 		}
 		if in.Action == "release" {
-			if cartStatus != "retrieved" || locked != id.UserID {
-				fail(w, 409, "Only the claimant can release this cart")
+			if locked != id.UserID {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 				return
 			}
-			_, e = tx.Exec("UPDATE pos_held_carts SET status='held',locked_by=NULL WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
+			if cartStatus != "retrieved" {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+				return
+			}
+			var released sql.Result
+			released, e = tx.Exec("UPDATE pos_held_carts SET status='held',locked_by=NULL WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
+			if e == nil {
+				var n int64
+				n, e = released.RowsAffected()
+				if e == nil && n != 1 {
+					terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+					return
+				}
+			}
 			result = map[string]any{"cartId": entity, "status": "held"}
 		}
 		if in.Action == "update" {
-			if cartStatus != "retrieved" || locked != id.UserID {
-				fail(w, 409, "Only the claimant can update this cart")
+			if locked != id.UserID {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+				return
+			}
+			if cartStatus != "retrieved" {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 				return
 			}
 		}
 		if in.Action == "discard" {
-			if cartStatus != "retrieved" || locked != id.UserID {
-				fail(w, 409, "Only the claimant can discard this cart")
+			if locked != id.UserID {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+				return
+			}
+			if cartStatus != "retrieved" {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 				return
 			}
 			updated, updateErr := tx.Exec("UPDATE pos_held_carts SET status='cancelled',locked_by=NULL WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
@@ -152,7 +192,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 				var count int64
 				count, e = updated.RowsAffected()
 				if e == nil && count != 1 {
-					fail(w, 409, "Only the claimant can discard this cart")
+					terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 					return
 				}
 			}
@@ -160,19 +200,23 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			result = map[string]any{"cartId": entity, "status": "cancelled"}
 		}
 		if in.Action == "checkout" {
-			if cartStatus != "retrieved" || locked != id.UserID {
-				fail(w, 409, "Claim this cart before checkout")
+			if locked != id.UserID {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
+				return
+			}
+			if cartStatus != "retrieved" {
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 				return
 			}
 			if json.Unmarshal([]byte(stored), &lines) != nil {
-				fail(w, 409, "Invalid stored cart")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Invalid stored cart")
 				return
 			}
 		}
 	}
 	if in.Action == "hold" || in.Action == "update" || in.Action == "checkout" {
 		if len(lines) == 0 || len(lines) > 100 {
-			fail(w, 400, "Cart must contain 1 to 100 items")
+			terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Cart must contain 1 to 100 items")
 			return
 		}
 		seen := map[string]bool{}
@@ -185,7 +229,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		var subtotal, discountTotal int64
 		for _, line := range lines {
 			if line.ItemID == "" || len(line.ItemID) > 256 || line.Quantity < 1 || line.Quantity > 1000 || seen[line.ItemID] {
-				fail(w, 400, "Invalid or duplicate cart item")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Invalid or duplicate cart item")
 				return
 			}
 			seen[line.ItemID] = true
@@ -193,7 +237,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			var price, stock int64
 			e = tx.QueryRow("SELECT barcode,name,price,stock_quantity FROM pos_catalog_items WHERE organization_id=? AND id=? AND is_active=1", id.OrganizationID, line.ItemID).Scan(&barcode, &name, &price, &stock)
 			if errors.Is(e, sql.ErrNoRows) {
-				fail(w, 404, "Active product not found")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusNotFound, "Active product not found")
 				return
 			}
 			if e != nil {
@@ -201,16 +245,16 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 				return
 			}
 			if price < 0 || price > 1000000 || subtotal > 1000000000-price*line.Quantity {
-				fail(w, 400, "Invalid cart total")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Invalid cart total")
 				return
 			}
 			gross := price * line.Quantity
 			if line.DiscountAmount < 0 || line.DiscountAmount > gross {
-				fail(w, 400, "Invalid line discount")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Invalid line discount")
 				return
 			}
 			if in.Action == "checkout" && stock < line.Quantity {
-				fail(w, 409, "Insufficient stock")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Insufficient stock")
 				return
 			}
 			subtotal += gross
@@ -231,7 +275,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 				var count int64
 				count, e = updated.RowsAffected()
 				if e == nil && count != 1 {
-					fail(w, 409, "Only the claimant can update this cart")
+					terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Cart is unavailable for this action")
 					return
 				}
 			}
@@ -239,11 +283,15 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 			result = map[string]any{"cartId": entity, "status": "retrieved"}
 		} else {
 			if in.Tender < total {
-				fail(w, 400, "Cash tender is less than the total")
+				terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusBadRequest, "Cash tender is less than the total")
 				return
 			}
 			entity = "sale_" + token()
 			receipt := "POS-" + strings.ToUpper(token()[:12])
+			if _, e = tx.Exec("SAVEPOINT cart_business"); e != nil {
+				fail(w, 503, "Could not protect cart checkout")
+				return
+			}
 			_, e = tx.Exec("INSERT INTO pos_sales(id,organization_id,receipt_number,store_id,register_id,shift_id,cashier_id,subtotal,discount_amount,total_amount,tender_amount,change_amount,payment_method,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'cash','completed',?)", entity, id.OrganizationID, receipt, store, register, in.ShiftID, id.UserID, subtotal, discountTotal, total, in.Tender, in.Tender-total, in.Key)
 			for _, line := range resolvedLines {
 				if e != nil {
@@ -255,7 +303,7 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 					var n int64
 					n, e = updated.RowsAffected()
 					if e == nil && n != 1 {
-						fail(w, 409, "Stock changed; refresh and retry")
+						terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Stock changed; refresh and retry", true)
 						return
 					}
 				}
@@ -264,7 +312,16 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 				}
 			}
 			if e == nil && in.CartID != "" {
-				_, e = tx.Exec("UPDATE pos_held_carts SET status='completed' WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
+				var completed sql.Result
+				completed, e = tx.Exec("UPDATE pos_held_carts SET status='completed' WHERE organization_id=? AND id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, in.CartID, id.UserID)
+				if e == nil {
+					var n int64
+					n, e = completed.RowsAffected()
+					if e == nil && n != 1 {
+						terminalPOSCartRejection(w, tx, id.OrganizationID, in.Key, endpoint, hash, http.StatusConflict, "Claimed cart changed; refresh and retry", true)
+						return
+					}
+				}
 			}
 			result = map[string]any{"saleId": entity, "receiptNumber": receipt, "subtotal": subtotal, "discountAmount": discountTotal, "totalAmount": total, "changeAmount": in.Tender - total}
 		}
@@ -287,4 +344,27 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 		return
 	}
 	ok(w, result)
+}
+
+func terminalPOSCartRejection(w http.ResponseWriter, tx *sql.Tx, organizationID, key, endpoint, fingerprint string, status int, message string, rollbackBusiness ...bool) {
+	if len(rollbackBusiness) > 0 && rollbackBusiness[0] {
+		if _, err := tx.Exec("ROLLBACK TO SAVEPOINT cart_business"); err != nil {
+			fail(w, 503, "Could not roll back rejected cart operation")
+			return
+		}
+		if _, err := tx.Exec("RELEASE SAVEPOINT cart_business"); err != nil {
+			fail(w, 503, "Could not finish rejected cart operation")
+			return
+		}
+	}
+	body, _ := json.Marshal(map[string]any{"success": false, "error": map[string]string{"message": message, "outcome": "not_applied"}})
+	if _, err := tx.Exec("INSERT INTO idempotency_keys(id,organization_id,key,endpoint,request_hash,response_status,response_body) VALUES(?,?,?,?,?,?,?)", "idem_"+token(), organizationID, key, endpoint, fingerprint, status, string(body)); err != nil {
+		fail(w, 503, "Unable to save terminal cart retry state")
+		return
+	}
+	if err := tx.Commit(); err != nil {
+		fail(w, 503, "Could not save terminal cart rejection")
+		return
+	}
+	writeJSON(w, status, map[string]any{"success": false, "error": map[string]string{"message": message, "outcome": "not_applied"}})
 }

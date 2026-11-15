@@ -24,6 +24,7 @@ Use the existing `POST /api/stations/pos/business` command envelope and organiza
 - Resolve every shift by both `shift_id` and authenticated `organization_id`; foreign-organization and missing shifts must not disclose one another.
 - Cash movements require an open shift owned by the cashier or an enabled back-office admin. Preserve the actor ID in audit data. Do not let a front operator modify another cashier's drawer.
 - Closing follows the existing rule: the shift owner or an authorized administrator may close an open shift. Recheck both owner/role and open state inside the write transaction.
+- Do not close a shift while its cashier has any `retrieved` held cart in that organization and store. The held-cart schema does not associate a cart with one specific shift, so this guard checks the cashier's claimed carts across the same store; shared `held` carts do not block closing. Refuse with a durable same-key `not_applied` result. Claim and close serialize in their write transactions, so either the claim is visible and close is rejected, or close wins and the claim is terminally rejected. Never auto-release a cart.
 - P06 records only drawer movements and closing variance. It does not create payouts, sales, refunds, or stock changes.
 
 ## Accounting invariants

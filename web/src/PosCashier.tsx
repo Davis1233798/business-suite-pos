@@ -410,6 +410,9 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
       } else {
         clearHeldOperation();
         setCartOperationUncertain(false); setCartOperationAction('');
+        if (provenNotApplied && reason instanceof ApiError && [404, 409].includes(reason.status)) {
+          try { await refreshTerminal(); } catch { /* preserve the definitive rejection */ }
+        }
         if (operation.action === 'claim' && reason instanceof ApiError && reason.status === 409) {
           try { await refreshHeldCarts(String(operation.body.shiftId || '')); } catch { /* keep the conflict visible */ }
           setError(tr('Another cashier claimed this cart. The held list was refreshed.'));
@@ -636,6 +639,9 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         clearCheckoutOperation();
         retryKey.current = '';
         setCheckoutUncertain(false);
+        if (provenNotApplied && reason instanceof ApiError && [404, 409].includes(reason.status)) {
+          try { await refreshTerminal(); } catch { /* preserve the definitive rejection */ }
+        }
         let claimedCartRefresh: boolean | null = null;
         if (operation.claimedCartId && reason instanceof ApiError && [400, 404, 409].includes(reason.status)) {
           try {

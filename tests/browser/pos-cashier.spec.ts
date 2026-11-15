@@ -96,6 +96,7 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   await expect(page.getByText('Cold brew coffee')).toBeVisible();
   await expect(page.getByLabel('Quantity Cold brew coffee')).toHaveValue('2');
   await expect(page.getByText('Subtotal $200')).toBeVisible();
+  await expect(barcode).toBeEnabled();
   await page.getByLabel('Discount Cold brew coffee').fill('10');
   await expect(page.getByLabel('Discount Cold brew coffee')).toHaveValue('10');
   await expect(page.locator('.pos-basket li')).toContainText('$190');
@@ -135,6 +136,80 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   expect(checkoutRequests.slice(1).every(request => JSON.stringify(request) === JSON.stringify(checkoutRequests[0]))).toBe(true);
   expect(checkoutRequests[0].lines).toEqual([{ itemId: product.id, quantity: 2, discountAmount: 10 }]);
   expect(checkoutRequests[0]).not.toHaveProperty('total');
+});
+
+test('terminal no-effect checkout rejection releases the old key for a corrected sale', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
+    registers: [register], openShifts: [{ ...openCashShift }],
+  } } }));
+  await page.route('**/api/stations/pos/barcode?**', route => route.fulfill({ json: { success: true, data: product } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary checkout failure' } } });
+    } else if (requests.length === 2) {
+      await route.fulfill({ status: 409, json: { success: false, error: { message: 'Stock changed', outcome: 'not_applied' } } });
+    } else {
+      await route.fulfill({ json: { success: true, data: {
+        saleId: 'sale-corrected', receiptNumber: 'POS-CORRECTED', subtotal: 200, discountAmount: 0,
+        totalAmount: 200, changeAmount: 50,
+      } } });
+    }
+  });
+  await cashier(page);
+  const barcode = page.getByLabel('Scan barcode');
+  await barcode.fill(product.barcode); await barcode.press('Enter');
+  await page.getByLabel('Cash tendered').fill('100');
+  await page.getByRole('button', { name: 'Complete cash sale' }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await page.getByRole('button', { name: 'Retry same sale' }).click();
+  await expect(page.getByRole('alert')).toContainText('Stock changed');
+  await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeVisible();
+  await expect(page.getByLabel('Quantity Cold brew coffee')).toBeEnabled();
+  expect(requests[1]).toEqual(requests[0]);
+
+  await page.getByLabel('Quantity Cold brew coffee').fill('2');
+  await page.getByLabel('Cash tendered').fill('250');
+  await page.getByRole('button', { name: 'Complete cash sale' }).click();
+  await expect(page.getByText('POS-CORRECTED')).toBeVisible();
+  expect(requests).toHaveLength(3);
+  expect(requests[2].idempotencyKey).not.toBe(requests[0].idempotencyKey);
+  expect(requests[2].lines).toEqual([{ itemId: product.id, quantity: 2, discountAmount: 0 }]);
+});
+
+test('closed-shift checkout marker clears the pending sale and refreshes shift state', async ({ page }) => {
+  let shiftOpen = true;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
+    registers: [register], openShifts: shiftOpen ? [{ ...openCashShift }] : [],
+  } } }));
+  await page.route('**/api/stations/pos/barcode?**', route => route.fulfill({ json: { success: true, data: product } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      shiftOpen = false;
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary checkout failure' } } });
+    } else {
+      await route.fulfill({ status: 409, json: { success: false, error: { message: 'Shift is not open', outcome: 'not_applied' } } });
+    }
+  });
+  await cashier(page);
+  const barcode = page.getByLabel('Scan barcode');
+  await barcode.fill(product.barcode); await barcode.press('Enter');
+  await page.getByLabel('Cash tendered').fill('100');
+  await page.getByRole('button', { name: 'Complete cash sale' }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await page.getByRole('button', { name: 'Retry same sale' }).click();
+  await expect(page.getByRole('alert')).toContainText('Shift is not open');
+  await expect(page.getByText('No open shift')).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry same sale' })).toHaveCount(0);
+  await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  expect(requests[1]).toEqual(requests[0]);
+  await page.getByRole('button', { name: 'Remove Cold brew coffee' }).click();
+  await expect(page.getByRole('button', { name: 'Open shift' })).toBeEnabled();
 });
 
 test('read-only POS identity cannot open a shift or submit a sale', async ({ page }) => {
@@ -377,6 +452,43 @@ test('ambiguous hold retries the exact named discounted basket with the same ide
   await expect(page.locator('.pos-basket li')).toHaveCount(0);
   expect(requests).toHaveLength(5);
   expect(requests.slice(1).every(request => JSON.stringify(request) === JSON.stringify(requests[0]))).toBe(true);
+});
+
+test('terminal no-effect hold rejection releases the old key and allows a fresh hold', async ({ page }) => {
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: {
+    registers: [register], openShifts: [{ ...openCashShift }],
+  } } }));
+  await page.route('**/api/stations/pos/barcode?**', route => route.fulfill({ json: { success: true, data: product } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: [] } }));
+  const requests: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON(); requests.push(body);
+    if (requests.length === 1) {
+      await route.fulfill({ status: 503, json: { success: false, error: { message: 'Temporary hold failure' } } });
+    } else if (requests.length === 2) {
+      await route.fulfill({ status: 409, json: { success: false, error: { message: 'Cart cannot be held', outcome: 'not_applied' } } });
+    } else {
+      await route.fulfill({ json: { success: true, data: { cartId: 'cart-corrected', status: 'held' } } });
+    }
+  });
+  await cashier(page);
+  const barcode = page.getByLabel('Scan barcode');
+  await barcode.fill(product.barcode); await barcode.press('Enter');
+  await page.getByLabel('Cart name').fill('Retry after terminal rejection');
+  await page.getByRole('button', { name: 'Hold basket' }).click();
+  await expect(page.getByRole('alert')).toContainText('outcome is unconfirmed');
+  await page.getByRole('button', { name: 'Retry hold' }).click();
+  await expect(page.getByRole('alert')).toContainText('Cart cannot be held');
+  await expect(page.getByLabel('Cart name')).toBeEnabled();
+  await expect(page.getByLabel('Quantity Cold brew coffee')).toBeEnabled();
+  expect(requests[1]).toEqual(requests[0]);
+
+  await page.getByLabel('Cart name').fill('Corrected hold');
+  await page.getByRole('button', { name: 'Hold basket' }).click();
+  await expect(page.locator('.pos-basket li')).toHaveCount(0);
+  expect(requests).toHaveLength(3);
+  expect(requests[2].idempotencyKey).not.toBe(requests[0].idempotencyKey);
+  expect(requests[2].cartName).toBe('Corrected hold');
 });
 
 test('unconfirmed held-cart claim blocks shift close and recovers its original request after reload', async ({ page }) => {

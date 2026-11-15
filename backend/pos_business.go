@@ -307,9 +307,9 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		result = map[string]any{"movementId": entityID, "shiftId": in.ShiftID, "movementType": in.MovementType, "amount": in.Amount, "reason": strings.TrimSpace(in.Reason)}
 	case "close":
-		var cashier, status string
+		var store, cashier, status string
 		var opening int64
-		e = tx.QueryRow("SELECT cashier_id,status,opening_cash FROM pos_shifts WHERE id=? AND organization_id=?", in.ShiftID, id.OrganizationID).Scan(&cashier, &status, &opening)
+		e = tx.QueryRow("SELECT store_id,cashier_id,status,opening_cash FROM pos_shifts WHERE id=? AND organization_id=?", in.ShiftID, id.OrganizationID).Scan(&store, &cashier, &status, &opening)
 		if errors.Is(e, sql.ErrNoRows) {
 			terminalPOSBusinessRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 404, "Shift not found")
 			return
@@ -324,6 +324,15 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		if cashier != id.UserID && !(grant.Role == "admin" && grant.Scope == "back") {
 			fail(w, 403, "Cannot close another cashier's shift")
+			return
+		}
+		var claimedCarts int
+		if e = tx.QueryRow("SELECT count(*) FROM pos_held_carts WHERE organization_id=? AND store_id=? AND status='retrieved' AND locked_by=?", id.OrganizationID, store, cashier).Scan(&claimedCarts); e != nil {
+			fail(w, 503, "Cannot check claimed carts before shift close")
+			return
+		}
+		if claimedCarts > 0 {
+			terminalPOSBusinessRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Release or discard the cashier's claimed carts before closing this shift")
 			return
 		}
 		expected, calcErr := posShiftExpectedCash(tx, id.OrganizationID, in.ShiftID, opening)
