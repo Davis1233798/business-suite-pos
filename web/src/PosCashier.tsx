@@ -161,6 +161,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const closeDiscrepancyEstimate = Number.isSafeInteger(parsedClosingCash) && activeShift ? parsedClosingCash - expectedDrawerCash : null;
   const varianceReasonBytes = utf8Length(varianceNotes.trim());
   const shiftOperationLocked = pendingShiftOperation !== null;
+  const shiftOpenBlocked = checkoutUncertain || pendingCheckout !== null || cartOperationUncertain || pendingHeldOperation !== null || claimedCartId !== '' || heldCartDirty;
   const shiftCloseBlocked = checkoutUncertain || pendingCheckout !== null || cartOperationUncertain || pendingHeldOperation !== null || basket.length > 0 || claimedCartId !== '' || heldCartDirty;
 
   function clearShiftOperation() {
@@ -512,7 +513,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   }
 
   async function openShift() {
-    if (shiftCloseBlocked || !registerId || !Number.isSafeInteger(Number(openingCash)) || Number(openingCash) < 0) return;
+    if (shiftOpenBlocked || !registerId || !Number.isSafeInteger(Number(openingCash)) || Number(openingCash) < 0) return;
     setBusy(true); setError(''); setMessage('');
     if (!openShiftKey.current) openShiftKey.current = `open-${crypto.randomUUID()}`;
     try {
@@ -688,7 +689,7 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         {terminal?.registers.map(register => <option key={register.id} value={register.id}>{register.name}</option>)}
       </select></label>
       <label>{tr('Opening cash')}<input aria-label={tr('Opening cash')} inputMode="numeric" type="number" min="0" step="1" value={openingCash} onChange={event => setOpeningCash(event.target.value)} disabled={!writable || busy || openShiftUncertain}/></label>
-      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || shiftCloseBlocked || !registerId}>{openShiftUncertain ? tr('Retry opening shift') : tr('Open shift')}</button>
+      <button type="button" onClick={() => void openShift()} disabled={!writable || busy || shiftOpenBlocked || !registerId}>{openShiftUncertain ? tr('Retry opening shift') : tr('Open shift')}</button>
       {!writable && <p>{tr('Read-only access cannot open a shift or complete sales.')}</p>}
     </section>}
 

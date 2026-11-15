@@ -35,6 +35,42 @@ const refundSale = {
   lines: [{ saleLineId: 'line-a', itemId: 'item-a', name: 'Coffee', barcode: '4710001001', quantity: 3, refundedQuantity: 0, remainingQuantity: 3, lineTotal: 101 }],
 };
 
+test('cashier can scan before opening a shift, then open and check out without losing the basket', async ({ page }) => {
+  let openShifts: Array<{ id: string; registerId: string; status: string }> = [];
+  const checkouts: Record<string, any>[] = [];
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts } } }));
+  await page.route('**/api/stations/pos/barcode?**', route => route.fulfill({ json: { success: true, data: product } }));
+  await page.route('**/api/stations/pos/held-carts?**', route => route.fulfill({ json: { success: true, data: { items: [], hasMore: false, nextCursor: '' } } }));
+  await page.route('**/api/stations/pos/business', async route => {
+    expect(route.request().postDataJSON()).toMatchObject({ action: 'open', registerId: register.id, openingCash: 0 });
+    openShifts = [{ id: 'shift-pre-scanned', registerId: register.id, status: 'open' }];
+    await route.fulfill({ json: { success: true, data: { shiftId: 'shift-pre-scanned', status: 'open' } } });
+  });
+  await page.route('**/api/stations/pos/cart', async route => {
+    const body = route.request().postDataJSON();
+    checkouts.push(body);
+    await route.fulfill({ json: { success: true, data: {
+      saleId: 'sale-pre-scanned', receiptNumber: 'POS-PRE-SCANNED', subtotal: 100,
+      discountAmount: 0, totalAmount: 100, changeAmount: 0,
+    } } });
+  });
+
+  await cashier(page);
+  const barcode = page.getByLabel('Scan barcode');
+  await barcode.fill(product.barcode);
+  await barcode.press('Enter');
+  await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  await expect(page.getByRole('button', { name: 'Open shift' })).toBeEnabled();
+  await page.getByRole('button', { name: 'Open shift' }).click();
+  await expect(page.getByText('Shift open · shift-pre-scanned')).toBeVisible();
+  await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
+  await page.getByLabel('Cash tendered').fill('100');
+  await page.getByRole('button', { name: 'Complete cash sale' }).click();
+  await expect(page.getByText('POS-PRE-SCANNED')).toBeVisible();
+  expect(checkouts).toHaveLength(1);
+  expect(checkouts[0]).toMatchObject({ action: 'checkout', shiftId: 'shift-pre-scanned', lines: [{ itemId: product.id, quantity: 1 }] });
+});
+
 test('cashier opens a shift, scans twice, applies a fixed line discount, and retries checkout with the same key', async ({ page }) => {
   let openShifts: Array<{ id: string; registerId: string; status: string }> = [];
   const openRequests: Record<string, unknown>[] = [];
