@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -237,12 +238,36 @@ var printKinds = map[string]PrintKind{
 }
 
 func (a *App) printData(w http.ResponseWriter, r *http.Request, id *Identity, site string) {
-	kind, exists := printKinds[r.URL.Query().Get("kind")]
+	params, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		fail(w, 400, "Invalid print query")
+		return
+	}
+	kindValues := params["kind"]
+	if len(kindValues) != 1 || kindValues[0] == "" {
+		fail(w, 400, "Provide exactly one print format")
+		return
+	}
+	kind, exists := printKinds[kindValues[0]]
 	if !exists || kind.Site != site {
 		fail(w, 400, "Unsupported print format")
 		return
 	}
-	recordID := r.URL.Query().Get("id")
+	reprintValues, reprintRequested := params["reprint"]
+	reprint := false
+	if reprintRequested {
+		if site != "pos" || kind.Dataset != "sales" || len(reprintValues) != 1 || reprintValues[0] != "true" {
+			fail(w, 400, "Reprint is only valid once as reprint=true for a POS receipt")
+			return
+		}
+		reprint = true
+	}
+	recordIDs := params["id"]
+	if len(recordIDs) != 1 || recordIDs[0] == "" {
+		fail(w, 400, "Provide exactly one document ID")
+		return
+	}
+	recordID := recordIDs[0]
 	table := ""
 	for _, d := range datasets[site] {
 		if d.Key == kind.Dataset {
@@ -251,7 +276,7 @@ func (a *App) printData(w http.ResponseWriter, r *http.Request, id *Identity, si
 	}
 	query := "SELECT * FROM " + table + " WHERE organization_id=? AND id=?"
 	args := []any{id.OrganizationID, recordID}
-	if site == "pos" && kind.Dataset == "sales" && id.grant(site).Scope != "back" {
+	if site == "pos" && kind.Dataset == "sales" && (id.grant(site).Scope != "back" || reprint) {
 		query += " AND cashier_id=?"
 		args = append(args, id.UserID)
 	}
@@ -268,5 +293,10 @@ func (a *App) printData(w http.ResponseWriter, r *http.Request, id *Identity, si
 			return
 		}
 	}
-	ok(w, map[string]any{"title": kind.Title, "record": rows[0], "lines": lines, "printedBy": id.Name, "organizationId": id.OrganizationID})
+	result := map[string]any{"title": kind.Title, "record": rows[0], "lines": lines, "printedBy": id.Name, "organizationId": id.OrganizationID}
+	if reprint {
+		// Explicit receipt reprints are read-only and always scoped to the requesting cashier.
+		result["isReprint"] = true
+	}
+	ok(w, result)
 }
