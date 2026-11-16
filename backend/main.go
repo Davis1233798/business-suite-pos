@@ -27,8 +27,13 @@ var migrations embed.FS
 var sites = []string{"mes", "erp", "pos", "crm", "dining", "shop"}
 
 type App struct {
-	db     *sql.DB
-	assets string
+	db                       *sql.DB
+	assets                   string
+	consumerIdentityEnabled  bool
+	consumerChallengeSender  ConsumerChallengeSender
+	trustedProxyNetworks     []*net.IPNet
+	consumerPasswordHasher   func(string) (string, error)
+	consumerPasswordVerifier func(string, string) bool
 }
 type Grant struct {
 	Site    string `json:"site"`
@@ -128,7 +133,7 @@ func openDB(file string) (*sql.DB, error) {
 		}
 	}
 	files = append(files, "pos_guards.sql")
-	files = append(files, "0004_station_identity.sql", "0005_traffic_lab.sql")
+	files = append(files, "0004_station_identity.sql", "0005_traffic_lab.sql", "0006_pos_consumer_identity.sql")
 	for _, f := range files {
 		b, err := migrations.ReadFile("migrations/" + f)
 		if err != nil {
@@ -391,6 +396,18 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if strings.HasPrefix(r.URL.Path, "/api/pos/consumer/") && r.Method != http.MethodGet && r.Method != http.MethodHead {
+		origin := r.Header.Get("Origin")
+		secure := trustedProxyRequestSecure(r, a.trustedProxyNetworks)
+		scheme := "http"
+		if secure {
+			scheme = "https"
+		}
+		if origin == "" || origin != scheme+"://"+r.Host {
+			fail(w, http.StatusForbidden, "A same-origin request is required")
+			return
+		}
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", func(w http.ResponseWriter, r *http.Request) {
 		if a.db.Ping() != nil {
@@ -400,6 +417,7 @@ func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		ok(w, map[string]string{"backend": "go", "status": "ready", "revision": os.Getenv("SUITE_RELEASE_SHA")})
 	})
 	mux.HandleFunc("/api/auth/{action}", a.auth)
+	mux.HandleFunc("/api/pos/consumer/{organization}/{action}", a.consumerIdentityAPI)
 	mux.HandleFunc("/api/stations/{site}/traffic", a.trafficAPI)
 	mux.HandleFunc("/api/stations/{site}/{action}", a.stationAPI)
 	mux.HandleFunc("/api/", func(w http.ResponseWriter, r *http.Request) {
@@ -454,7 +472,10 @@ func main() {
 	if addr == "" {
 		addr = "127.0.0.1:8095"
 	}
-	server := &http.Server{Addr: addr, Handler: &App{db: db, assets: assets}, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
+	// Consumer routes stay off until durable abuse limits and asynchronous email
+	// delivery are configured. Tests inject the gate and sender explicitly.
+	app := &App{db: db, assets: assets, consumerIdentityEnabled: false, trustedProxyNetworks: parseTrustedProxyCIDRs(os.Getenv("POS_CONSUMER_TRUSTED_PROXY_CIDRS"))}
+	server := &http.Server{Addr: addr, Handler: app, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 20 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 16384}
 	listener, e := net.Listen("tcp", addr)
 	if e != nil {
 		log.Fatal(e)
