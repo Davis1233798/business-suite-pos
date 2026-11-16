@@ -53,6 +53,9 @@
 .pos-money-total strong { color: #a16207; font-size: 1.45rem; }
 .pos-cashier .pos-checkout { min-height: 3.25rem; background: #a16207; }
 .pos-receipt { display: grid; gap: .3rem; border-radius: .7rem; background: #ecfdf5; padding: .85rem; color: #065f46; }
+.pos-reprint-preview { max-width: 480px; gap: .35rem; margin-inline: auto; border: 2px dashed #991b1b; background: #fff; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+.pos-reprint-preview h2, .pos-reprint-preview p { margin: .25rem 0; }
+.pos-reprint-marker { display: block; border: 2px solid #991b1b; padding: .4rem; color: #991b1b; text-align: center; letter-spacing: .12em; }
 .pos-cashier-error, .pos-cashier-message { margin: 0; border-radius: .6rem; padding: .7rem .85rem; }
 .pos-cashier-error { background: #fef2f2; color: #991b1b; }
 .pos-cashier-message { background: #ecfdf5; color: #065f46; }

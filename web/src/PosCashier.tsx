@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { tr } from './locale';
+import { reconcileReceiptHistory, type LocalCheckoutReceipt, type ReceiptHistorySale } from './receiptHistory';
 import './pos-cashier.css';
 
 type Register = { id: string; name: string; storeId: string };
@@ -8,6 +9,7 @@ type Terminal = { registers: Register[]; openShifts: Shift[] };
 type Product = { id: string; name: string; barcode: string; price: number; stockQuantity: number; isActive?: boolean };
 type BasketLine = { item: Product; quantity: number; discountAmount: number };
 type SaleReceipt = { saleId: string; receiptNumber: string; subtotal: number; discountAmount: number; totalAmount: number; changeAmount: number };
+type ReprintedReceipt = { isReprint: boolean; record: { receiptNumber: string; subtotal: number; discountAmount: number; totalAmount: number; tenderAmount: number; changeAmount: number }; lines: Array<{ id: string; name: string; quantity: number; lineTotal: number }>; printedBy: string };
 type HeldCartLine = { itemId: string; quantity: number; discountAmount: number; available: boolean; product: Product | null };
 type HeldCart = { cartId: string; cartName: string; heldAt: string; status: 'held' | 'retrieved'; lines: HeldCartLine[] };
 type HeldCartPage = { items: HeldCart[]; hasMore: boolean; nextCursor: string };
@@ -27,6 +29,10 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const envelope = await response.json() as { success?: boolean; error?: { message?: string; outcome?: string }; data?: T };
   if (!response.ok || !envelope.success) throw new ApiError(tr(envelope.error?.message || `HTTP ${response.status}`), response.status, envelope.error?.outcome);
   return envelope.data as T;
+}
+
+function readReceiptHistory(signal?: AbortSignal) {
+  return api<{ sales?: ReceiptHistorySale[] }>('/api/stations/pos/data?view=front', signal ? { signal } : undefined);
 }
 
 function post<T>(path: string, body: unknown) {
@@ -112,12 +118,70 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
   const [receipt, setReceipt] = useState<SaleReceipt | null>(null);
+  const [receiptHistory, setReceiptHistory] = useState<ReceiptHistorySale[]>([]);
+  const [receiptHistoryLoading, setReceiptHistoryLoading] = useState(true);
+  const [receiptHistoryError, setReceiptHistoryError] = useState('');
+  const [selectedReceiptId, setSelectedReceiptId] = useState('');
+  const [reprintedReceipt, setReprintedReceipt] = useState<ReprintedReceipt | null>(null);
+  const [reprintBusy, setReprintBusy] = useState(false);
+  const [reprintError, setReprintError] = useState('');
   const retryKey = useRef(pendingCheckout?.body.idempotencyKey || '');
+  const localCheckoutReceipts = useRef<LocalCheckoutReceipt[]>([]);
+  const checkoutVersion = useRef(0);
+  const reprintRequestSequence = useRef(0);
   const heldOperation = useRef<HeldOperation | null>(pendingHeldOperation);
   const heldReadSequence = useRef(0);
   const writeLock = useRef(false);
   const openShiftKey = useRef('');
   const scanInput = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const requestVersion = checkoutVersion.current;
+    void readReceiptHistory(controller.signal)
+      .then(result => {
+        if (controller.signal.aborted) return;
+        const recent = result.sales || [];
+        const reconciled = reconcileReceiptHistory(recent, localCheckoutReceipts.current, requestVersion);
+        localCheckoutReceipts.current = reconciled.pendingCheckouts;
+        const history = reconciled.history;
+        setReceiptHistory(history);
+        setSelectedReceiptId(current => history.some(sale => sale.id === current) ? current : '');
+      })
+      .catch(reason => { if (!controller.signal.aborted) setReceiptHistoryError((reason as Error).message); })
+      .finally(() => { if (!controller.signal.aborted) setReceiptHistoryLoading(false); });
+    return () => controller.abort();
+  }, []);
+
+  async function refreshReceiptHistory() {
+    reprintRequestSequence.current++;
+    const requestVersion = checkoutVersion.current;
+    setReceiptHistoryLoading(true); setReceiptHistoryError(''); setReprintedReceipt(null);
+    try {
+      const result = await readReceiptHistory();
+      const recent = result.sales || [];
+      const reconciled = reconcileReceiptHistory(recent, localCheckoutReceipts.current, requestVersion);
+      localCheckoutReceipts.current = reconciled.pendingCheckouts;
+      const history = reconciled.history;
+      setReceiptHistory(history);
+      setSelectedReceiptId(current => history.some(sale => sale.id === current) ? current : '');
+    } catch (reason) { setReceiptHistoryError((reason as Error).message); }
+    finally { setReceiptHistoryLoading(false); }
+  }
+
+  async function reprintSelectedReceipt() {
+    if (!selectedReceiptId || reprintBusy) return;
+    const requestSequence = ++reprintRequestSequence.current;
+    const requestedReceiptId = selectedReceiptId;
+    setReprintBusy(true); setReprintError(''); setReprintedReceipt(null);
+    try {
+      const result = await api<ReprintedReceipt>(`/api/stations/pos/print?kind=pos-receipt&id=${encodeURIComponent(requestedReceiptId)}&reprint=true`);
+      if (requestSequence !== reprintRequestSequence.current) return;
+      if (!result.isReprint) throw new Error(tr('Reprint marker missing from the server response.'));
+      setReprintedReceipt(result);
+    } catch (reason) { if (requestSequence === reprintRequestSequence.current) setReprintError((reason as Error).message); }
+    finally { setReprintBusy(false); }
+  }
 
   const refreshTerminal = useCallback(async () => {
     const next = await api<Terminal>('/api/stations/pos/terminal');
@@ -618,6 +682,10 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
       const result = await post<SaleReceipt>('/api/stations/pos/cart', operation.body);
       clearCheckoutOperation();
       setReceipt(result); setBasket([]); setTender(''); retryKey.current = '';
+      const confirmedReceipt = { id: result.saleId, receiptNumber: result.receiptNumber, totalAmount: result.totalAmount };
+      checkoutVersion.current++;
+      localCheckoutReceipts.current = [{ sale: confirmedReceipt, version: checkoutVersion.current }, ...localCheckoutReceipts.current.filter(entry => entry.sale.id !== result.saleId)].slice(0, 500);
+      setReceiptHistory(current => [confirmedReceipt, ...current.filter(sale => sale.id !== result.saleId)].slice(0, 500));
       const completedHeldCart = operation.claimedCartId;
       setClaimedCartId(''); setHeldCartDirty(false); setCartName('');
       setCheckoutUncertain(false);
@@ -780,5 +848,33 @@ export function PosCashier({ role, ownerKey }: { role: string; ownerKey: string 
         {receipt && <div className="pos-receipt" role="status"><strong>{tr('Receipt')} {receipt.receiptNumber}</strong><span>{tr('Subtotal')} ${receipt.subtotal}</span><span>{tr('Discount')} -${receipt.discountAmount}</span><span>{tr('Total due')} ${receipt.totalAmount}</span><span>{tr('Cash change')} ${receipt.changeAmount}</span><span>{tr('Receipt amounts are calculated by the POS server.')}</span></div>}
       </section>
     </div>
+    <section className="pos-cashier-panel pos-receipt-history" aria-label={tr('Receipt history')}>
+      <h2>{tr('Receipt history')}</h2>
+      <button type="button" className="pos-secondary" onClick={() => void refreshReceiptHistory()} disabled={receiptHistoryLoading}>{receiptHistoryLoading ? tr('Loading receipt history…') : tr('Refresh receipt history')}</button>
+      {receiptHistoryLoading && <p className="pos-cashier-note">{tr('Loading receipt history…')}</p>}
+      {receiptHistoryError && <p role="alert" className="pos-cashier-error">{receiptHistoryError}</p>}
+      {!receiptHistoryLoading && !receiptHistoryError && receiptHistory.length === 0 && <p className="pos-cashier-empty">{tr('No receipts available for this cashier.')}</p>}
+      {receiptHistory.length > 0 && <>
+        <label htmlFor="pos-reprint-receipt">{tr('Receipt to reprint')}</label>
+        <select id="pos-reprint-receipt" value={selectedReceiptId} onChange={event => { reprintRequestSequence.current++; setSelectedReceiptId(event.target.value); setReprintedReceipt(null); setReprintError(''); }}>
+          <option value="">{tr('Select a receipt')}</option>
+          {receiptHistory.map(sale => <option key={sale.id} value={sale.id}>{sale.receiptNumber} · {money(sale.totalAmount)}{sale.createdAt ? ` · ${sale.createdAt}` : ''}</option>)}
+        </select>
+        <button type="button" className="pos-secondary" onClick={() => void reprintSelectedReceipt()} disabled={!selectedReceiptId || reprintBusy}>{reprintBusy ? tr('Loading receipt…') : tr('Reprint receipt')}</button>
+      </>}
+      {reprintError && <p role="alert" className="pos-cashier-error">{reprintError}</p>}
+    </section>
+    {reprintedReceipt?.isReprint && <>
+      <style data-pos-reprint-style>{'@media print{@page{size:80mm auto;margin:2mm}body:has(.pos-reprint-preview) .station-sidebar,body:has(.pos-reprint-preview) .pos-cashier>:not(.pos-reprint-preview){display:none!important}body:has(.pos-reprint-preview) .pos-cashier{display:block!important;max-width:none!important;margin:0!important;padding:0!important}.pos-reprint-preview{display:block!important;width:76mm;margin:0 auto;padding:0;border:0;box-shadow:none;font:10pt/1.35 monospace}}'}</style>
+      <section className="pos-cashier-panel pos-reprint-preview" aria-label={tr('Reprinted receipt preview')}>
+        <strong className="pos-reprint-marker">{tr('REPRINT COPY')}</strong>
+        <h2>{reprintedReceipt.record.receiptNumber}</h2>
+        <p>{tr('Cash transaction demo · Not a tax invoice')}</p>
+        {reprintedReceipt.lines.map(line => <p key={line.id}>{line.name} × {line.quantity}: ${line.lineTotal}</p>)}
+        <p>{tr('Total')}: ${reprintedReceipt.record.totalAmount} · {tr('Tendered')}: ${reprintedReceipt.record.tenderAmount} · {tr('Change')}: ${reprintedReceipt.record.changeAmount}</p>
+        <p>{tr('Printed by')}: {reprintedReceipt.printedBy}</p>
+        <button type="button" className="pos-secondary no-print" onClick={() => window.print()}>{tr('Print reprinted receipt')}</button>
+      </section>
+    </>}
   </section>;
 }

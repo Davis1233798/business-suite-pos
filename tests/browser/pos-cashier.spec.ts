@@ -3,7 +3,9 @@ import { test, expect } from '@playwright/test';
 const register = { id: 'register-a', name: 'Register A', storeId: 'store-a' };
 const product = { id: 'item-coffee', name: 'Cold brew coffee', barcode: '4710001001', price: 100, stockQuantity: 100 };
 
-async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' | 'admin' = 'operator', scope: 'front' | 'back' = 'front', language: 'en' | 'zh-TW' = 'en', userId = 'cashier-a') {
+type ReceiptHistoryFixture = { id: string; receiptNumber: string; totalAmount: number; createdAt?: string };
+
+async function cashier(page: import('@playwright/test').Page, role: 'operator' | 'readonly' | 'admin' = 'operator', scope: 'front' | 'back' = 'front', language: 'en' | 'zh-TW' = 'en', userId = 'cashier-a', sales: ReceiptHistoryFixture[] = []) {
   await page.addInitScript(selectedLanguage => {
     if (!localStorage.getItem('suite-language')) localStorage.setItem('suite-language', selectedLanguage);
   }, language);
@@ -12,11 +14,114 @@ async function cashier(page: import('@playwright/test').Page, role: 'operator' |
     grants: [{ site: 'pos', role, scope, enabled: true }],
   } } }));
   await page.route('**/api/stations/pos/data?view=front', route => route.fulfill({ json: { success: true, data: {
-    catalogItems: [], sales: [],
+    catalogItems: [], sales,
   } } }));
   await page.goto('/pos/front');
   await expect(page.getByRole('heading', { name: language === 'zh-TW' ? '收銀' : 'Cashier' })).toBeVisible();
 }
+
+test('cashier explicitly reprints an own receipt with a visible marker and no sale write', async ({ page }) => {
+  const ownSale = { id: 'sale-owned', receiptNumber: 'POS-OWN-001', totalAmount: 100, createdAt: '2026-11-16T10:00:00Z' };
+  const latestSale = { id: 'sale-latest', receiptNumber: 'POS-OWN-002', totalAmount: 180, createdAt: '2026-11-16T10:05:00Z' };
+  const staleRows = [ownSale, ...Array.from({ length: 499 }, (_, index) => ({ id: `stale-${index}`, receiptNumber: `POS-STALE-${index}`, totalAmount: 1 }))];
+  const latestRows = [latestSale, ...Array.from({ length: 499 }, (_, index) => ({ id: `latest-${index}`, receiptNumber: `POS-LATEST-${index}`, totalAmount: 2 }))];
+  const historyRows = [...staleRows];
+  const printRequests: string[] = [];
+  const historyRequests: string[] = [];
+  let cartWrites = 0;
+  await page.addInitScript(() => { window.print = () => { document.body.dataset.printCalled = 'true'; }; });
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [] } } }));
+  await page.route('**/api/stations/pos/print?**', async route => {
+    printRequests.push(route.request().url());
+    await route.fulfill({ json: { success: true, data: {
+      title: 'Receipts', isReprint: true,
+      record: { id: new URL(route.request().url()).searchParams.get('id'), receiptNumber: latestSale.receiptNumber, totalAmount: latestSale.totalAmount, tenderAmount: 200, changeAmount: 20 },
+      lines: [{ id: 'line-owned', name: 'Cold brew coffee', quantity: 1, lineTotal: 100 }],
+      printedBy: '<img src=x onerror="document.body.dataset.reprintXss=1">',
+    } } });
+  });
+  await page.route('**/api/stations/pos/cart', async route => { cartWrites++; await route.fulfill({ json: { success: true, data: {} } }); });
+  page.on('request', request => { if (request.url().includes('/api/stations/pos/data?view=front')) historyRequests.push(request.url()); });
+
+  await cashier(page, 'operator', 'front', 'en', 'cashier-a', historyRows);
+  await expect(page.getByRole('link', { name: 'Labels and documents' })).toHaveCount(0);
+  historyRows.splice(0, historyRows.length, ...latestRows);
+  await page.getByRole('button', { name: 'Refresh receipt history', exact: true }).click();
+  await expect(page.getByLabel('Receipt to reprint').locator('option').filter({ hasText: latestSale.receiptNumber })).toHaveCount(1);
+  await expect(page.getByLabel('Receipt to reprint').locator('option').filter({ hasText: ownSale.receiptNumber })).toHaveCount(0);
+  await expect(page.getByLabel('Receipt to reprint').locator('option')).toHaveCount(501);
+  expect(historyRequests).toHaveLength(2);
+  await page.getByLabel('Receipt to reprint').selectOption(latestSale.id);
+  await page.getByRole('button', { name: 'Reprint receipt', exact: true }).click();
+
+  const preview = page.locator('.pos-reprint-preview');
+  await expect(preview.getByText('REPRINT COPY', { exact: true })).toBeVisible();
+  await expect(preview).toContainText(latestSale.receiptNumber);
+  await expect(preview).toContainText('Cold brew coffee');
+  await expect(preview).toContainText('<img src=x onerror="document.body.dataset.reprintXss=1">');
+  await expect(preview.locator('img')).toHaveCount(0);
+  expect(await page.locator('body').getAttribute('data-reprint-xss')).toBeNull();
+  expect(new URL(printRequests[0]).searchParams.get('reprint')).toBe('true');
+  expect(new URL(printRequests[0]).searchParams.get('id')).toBe(latestSale.id);
+  expect(cartWrites).toBe(0);
+  await page.emulateMedia({ media: 'print' });
+  const printLayout = await page.evaluate(() => {
+    const main = document.querySelector('.station-main')!;
+    const cashierRoot = document.querySelector('.pos-cashier')!;
+    const previewArticle = document.querySelector('.pos-reprint-preview')!;
+    const history = document.querySelector('.pos-receipt-history')!;
+    const printButton = previewArticle.querySelector('button')!;
+    return {
+      printMedia: window.matchMedia('print').matches,
+      mainPadding: getComputedStyle(main).padding,
+      cashierPadding: getComputedStyle(cashierRoot).padding,
+      cashierMargin: getComputedStyle(cashierRoot).margin,
+      previewWidth: getComputedStyle(previewArticle).width,
+      previewVisible: previewArticle.getClientRects().length > 0,
+      historyVisible: history.getClientRects().length > 0,
+      printButtonVisible: printButton.getClientRects().length > 0,
+    };
+  });
+  expect(printLayout).toMatchObject({ printMedia: true, mainPadding: '0px', cashierPadding: '0px', cashierMargin: '0px', previewWidth: '287.234px', previewVisible: true, historyVisible: false, printButtonVisible: false });
+  await page.emulateMedia({ media: 'screen' });
+  const receiptPrintStyle = page.locator('style[data-pos-reprint-style]');
+  await expect(receiptPrintStyle).toHaveCount(1);
+  await preview.getByRole('button', { name: 'Print reprinted receipt', exact: true }).click();
+  expect(await page.locator('body').getAttribute('data-print-called')).toBe('true');
+  await expect(preview).toBeVisible();
+  await page.getByLabel('Receipt to reprint').selectOption('');
+  await expect(preview).toHaveCount(0);
+  await expect(receiptPrintStyle).toHaveCount(0);
+});
+
+test('late reprint response is discarded when the cashier changes the selected receipt', async ({ page }) => {
+  const saleA = { id: 'sale-a', receiptNumber: 'POS-A', totalAmount: 100 };
+  const saleB = { id: 'sale-b', receiptNumber: 'POS-B', totalAmount: 200 };
+  let releaseFirstResponse!: () => void;
+  const firstResponse = new Promise<void>(resolve => { releaseFirstResponse = resolve; });
+  let printCount = 0;
+  await page.route('**/api/stations/pos/terminal', route => route.fulfill({ json: { success: true, data: { registers: [register], openShifts: [] } } }));
+  await page.route('**/api/stations/pos/print?**', async route => {
+    const id = new URL(route.request().url()).searchParams.get('id');
+    printCount++;
+    if (printCount === 1) await firstResponse;
+    const sale = id === saleA.id ? saleA : saleB;
+    await route.fulfill({ json: { success: true, data: {
+      isReprint: true, record: { receiptNumber: sale.receiptNumber, subtotal: sale.totalAmount, discountAmount: 0, totalAmount: sale.totalAmount, tenderAmount: sale.totalAmount, changeAmount: 0 },
+      lines: [], printedBy: 'Cashier A',
+    } } });
+  });
+  await cashier(page, 'operator', 'front', 'en', 'cashier-a', [saleA, saleB]);
+  const requestA = page.waitForRequest(request => request.url().includes('/api/stations/pos/print?') && new URL(request.url()).searchParams.get('id') === saleA.id);
+  await page.getByLabel('Receipt to reprint').selectOption(saleA.id);
+  await page.getByRole('button', { name: 'Reprint receipt', exact: true }).click();
+  await requestA;
+  await page.getByLabel('Receipt to reprint').selectOption(saleB.id);
+  releaseFirstResponse();
+  await expect(page.locator('.pos-reprint-preview')).toHaveCount(0);
+  await page.getByRole('button', { name: 'Reprint receipt', exact: true }).click();
+  await expect(page.locator('.pos-reprint-preview')).toContainText(saleB.receiptNumber);
+});
 
 async function posBackOffice(page: import('@playwright/test').Page, role: 'admin' | 'operator' | 'readonly' = 'admin', scope: 'back' | 'front' = 'back', language: 'en' | 'zh-TW' = 'en') {
   await page.addInitScript(selectedLanguage => localStorage.setItem('suite-language', selectedLanguage), language);
@@ -66,7 +171,7 @@ test('cashier can scan before opening a shift, then open and check out without l
   await expect(page.locator('.pos-basket li')).toContainText('Cold brew coffee');
   await page.getByLabel('Cash tendered').fill('100');
   await page.getByRole('button', { name: 'Complete cash sale' }).click();
-  await expect(page.getByText('POS-PRE-SCANNED')).toBeVisible();
+  await expect(page.locator('.pos-receipt').getByText('POS-PRE-SCANNED')).toBeVisible();
   expect(checkouts).toHaveLength(1);
   expect(checkouts[0]).toMatchObject({ action: 'checkout', shiftId: 'shift-pre-scanned', lines: [{ itemId: product.id, quantity: 1 }] });
 });
@@ -122,7 +227,7 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
   await expect(page.getByText('Shift open · shift-a')).toBeVisible();
   expect(openRequests).toHaveLength(2);
   expect(openRequests[1]).toEqual(openRequests[0]);
-  expect(frontDataRequests).toHaveLength(0);
+  expect(frontDataRequests).toHaveLength(1);
 
   const barcode = page.getByLabel('Scan barcode');
   await barcode.fill(product.barcode);
@@ -164,9 +269,24 @@ test('cashier opens a shift, scans twice, applies a fixed line discount, and ret
       await expect(page.getByRole('button', { name: 'Review and close shift' })).toBeDisabled();
     }
   }
+  let releaseHistoryResponse!: () => void;
+  let notifyHistoryRequest!: () => void;
+  const historyResponse = new Promise<void>(resolve => { releaseHistoryResponse = resolve; });
+  const historyRequestStarted = new Promise<void>(resolve => { notifyHistoryRequest = resolve; });
+  await page.route('**/api/stations/pos/data?view=front', async route => {
+    notifyHistoryRequest();
+    await historyResponse;
+    await route.fulfill({ json: { success: true, data: { catalogItems: [], sales: [] } } });
+  });
+  const refreshRequest = page.waitForRequest(request => request.url().includes('/api/stations/pos/data?view=front'));
+  await page.getByRole('button', { name: 'Refresh receipt history', exact: true }).click();
+  await refreshRequest;
+  await historyRequestStarted;
   await page.getByRole('button', { name: 'Retry same sale' }).click();
-  await expect(page.getByText('POS-RECEIPT-A')).toBeVisible();
+  await expect(page.locator('.pos-receipt').getByText('POS-RECEIPT-A')).toBeVisible();
   await expect(page.locator('.pos-receipt').getByText('Change $10')).toBeVisible();
+  releaseHistoryResponse();
+  await expect(page.getByLabel('Receipt to reprint').locator('option').filter({ hasText: 'POS-RECEIPT-A' })).toHaveCount(1);
   expect(checkoutRequests).toHaveLength(5);
   expect(checkoutRequests[0]).toMatchObject({ action: 'checkout', shiftId: 'shift-a', tender: 200 });
   expect(checkoutRequests.slice(1).every(request => JSON.stringify(request) === JSON.stringify(checkoutRequests[0]))).toBe(true);
@@ -209,7 +329,7 @@ test('terminal no-effect checkout rejection releases the old key for a corrected
   await page.getByLabel('Quantity Cold brew coffee').fill('2');
   await page.getByLabel('Cash tendered').fill('250');
   await page.getByRole('button', { name: 'Complete cash sale' }).click();
-  await expect(page.getByText('POS-CORRECTED')).toBeVisible();
+  await expect(page.locator('.pos-receipt').getByText('POS-CORRECTED')).toBeVisible();
   expect(requests).toHaveLength(3);
   expect(requests[2].idempotencyKey).not.toBe(requests[0].idempotencyKey);
   expect(requests[2].lines).toEqual([{ itemId: product.id, quantity: 2, discountAmount: 0 }]);
@@ -713,7 +833,7 @@ test('independent cashier contexts race to claim one shared cart and only the wi
     await expect(loser.getByText('Shared basket')).toHaveCount(0);
     await winner.getByLabel('Cash tendered').fill('100');
     await winner.getByRole('button', { name: 'Complete cash sale' }).click();
-    await expect(winner.getByText(`POS-${lockOwner}`)).toBeVisible();
+    await expect(winner.locator('.pos-receipt').getByText(`POS-${lockOwner}`)).toBeVisible();
   } finally {
     await contextA.close();
     await contextB.close();
@@ -924,7 +1044,7 @@ test('recovered held-cart update rejection keeps staged lines dirty until a new 
   await expect(page.getByRole('button', { name: 'Complete cash sale' })).toBeEnabled();
   expect(cartRequests[3].idempotencyKey).not.toBe(cartRequests[1].idempotencyKey);
   await page.getByRole('button', { name: 'Complete cash sale' }).click();
-  await expect(page.getByText('POS-UPDATE-RECOVERY')).toBeVisible();
+  await expect(page.locator('.pos-receipt').getByText('POS-UPDATE-RECOVERY')).toBeVisible();
   expect(cartRequests[4]).toMatchObject({ action: 'checkout', cartId: 'cart-update-recovery' });
 });
 
