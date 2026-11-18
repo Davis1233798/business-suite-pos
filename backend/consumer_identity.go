@@ -139,6 +139,18 @@ func (a *App) consumerIdentityAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		a.consumerMe(w, r, organizationID)
+	case "pair":
+		if r.Method != http.MethodPost {
+			fail(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		a.consumerPair(w, r, organizationID)
+	case "transactions":
+		if r.Method != http.MethodGet {
+			fail(w, http.StatusMethodNotAllowed, "Method not allowed")
+			return
+		}
+		a.consumerTransactions(w, r, organizationID)
 	default:
 		fail(w, http.StatusNotFound, "Operation not found")
 	}
@@ -370,6 +382,108 @@ func trustedProxyRequestSecure(r *http.Request, trusted []*net.IPNet) bool {
 		}
 	}
 	return false
+}
+
+const consumerPairingLifetime = 5 * time.Minute
+
+func (a *App) resolveConsumerAccount(r *http.Request, organizationID string) (string, string, error) {
+	cookie, err := r.Cookie(consumerSessionCookieName)
+	if err != nil || len(cookie.Value) != 64 {
+		return "", "", errors.New("unauthorized")
+	}
+	if _, err = hex.DecodeString(cookie.Value); err != nil {
+		return "", "", errors.New("unauthorized")
+	}
+	var accountID, email string
+	err = a.db.QueryRow(`SELECT a.id, a.normalized_email FROM pos_consumer_sessions s JOIN pos_consumer_accounts a ON a.id=s.account_id AND a.organization_id=s.organization_id WHERE s.token_hash=? AND s.organization_id=? AND s.expires_at>? AND s.revoked_at IS NULL AND a.verified_at IS NOT NULL AND a.disabled=0`, digest(cookie.Value), organizationID, time.Now().UnixMilli()).Scan(&accountID, &email)
+	if err != nil {
+		return "", "", errors.New("unauthorized")
+	}
+	return accountID, email, nil
+}
+
+func (a *App) consumerPair(w http.ResponseWriter, r *http.Request, organizationID string) {
+	accountID, _, err := a.resolveConsumerAccount(r, organizationID)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "Please sign in to generate a pairing token")
+		return
+	}
+	pairToken := "pair_" + token()
+	now := time.Now()
+	expires := now.Add(consumerPairingLifetime)
+	if _, err = a.db.Exec(`INSERT INTO pos_consumer_pairing_tokens(token_hash,account_id,organization_id,expires_at,created_at) VALUES(?,?,?,?,?)`, digest(pairToken), accountID, organizationID, expires.UnixMilli(), now.UnixMilli()); err != nil {
+		fail(w, http.StatusServiceUnavailable, "Cannot generate pairing token")
+		return
+	}
+	ok(w, map[string]any{
+		"pairingToken": pairToken,
+		"expiresAt":    expires.UnixMilli(),
+	})
+}
+
+type consumerTransactionLine struct {
+	ID        string `json:"id"`
+	Barcode   string `json:"barcode"`
+	Name      string `json:"name"`
+	UnitPrice int64  `json:"unitPrice"`
+	Quantity  int    `json:"quantity"`
+	LineTotal int64  `json:"lineTotal"`
+}
+
+type consumerTransactionItem struct {
+	ID            string                    `json:"id"`
+	ReceiptNumber string                    `json:"receiptNumber"`
+	Subtotal      int64                     `json:"subtotal"`
+	TotalAmount   int64                     `json:"totalAmount"`
+	TenderAmount  int64                     `json:"tenderAmount"`
+	ChangeAmount  int64                     `json:"changeAmount"`
+	PaymentMethod string                    `json:"paymentMethod"`
+	Status        string                    `json:"status"`
+	CreatedAt     string                    `json:"createdAt"`
+	Lines         []consumerTransactionLine `json:"lines"`
+}
+
+func (a *App) consumerTransactions(w http.ResponseWriter, r *http.Request, organizationID string) {
+	accountID, _, err := a.resolveConsumerAccount(r, organizationID)
+	if err != nil {
+		fail(w, http.StatusUnauthorized, "Please sign in to view transactions")
+		return
+	}
+	rows, err := a.db.Query(`SELECT id, receipt_number, subtotal, total_amount, tender_amount, change_amount, payment_method, status, created_at FROM pos_sales WHERE organization_id=? AND customer_id=? ORDER BY created_at DESC, rowid DESC LIMIT 50`, organizationID, accountID)
+	if err != nil {
+		fail(w, http.StatusServiceUnavailable, "Cannot load transactions")
+		return
+	}
+	defer rows.Close()
+
+	var txns []consumerTransactionItem
+	for rows.Next() {
+		var item consumerTransactionItem
+		if err := rows.Scan(&item.ID, &item.ReceiptNumber, &item.Subtotal, &item.TotalAmount, &item.TenderAmount, &item.ChangeAmount, &item.PaymentMethod, &item.Status, &item.CreatedAt); err != nil {
+			fail(w, http.StatusInternalServerError, "Error reading transaction record")
+			return
+		}
+		item.Lines = []consumerTransactionLine{}
+		txns = append(txns, item)
+	}
+
+	for i := range txns {
+		lineRows, err := a.db.Query(`SELECT id, barcode, name, unit_price, quantity, line_total FROM pos_sale_lines WHERE organization_id=? AND sale_id=? ORDER BY rowid ASC`, organizationID, txns[i].ID)
+		if err == nil {
+			for lineRows.Next() {
+				var l consumerTransactionLine
+				if err := lineRows.Scan(&l.ID, &l.Barcode, &l.Name, &l.UnitPrice, &l.Quantity, &l.LineTotal); err == nil {
+					txns[i].Lines = append(txns[i].Lines, l)
+				}
+			}
+			lineRows.Close()
+		}
+	}
+
+	if txns == nil {
+		txns = []consumerTransactionItem{}
+	}
+	ok(w, map[string]any{"transactions": txns})
 }
 
 func parseTrustedProxyCIDRs(value string) []*net.IPNet {

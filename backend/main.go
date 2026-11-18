@@ -133,7 +133,7 @@ func openDB(file string) (*sql.DB, error) {
 		}
 	}
 	files = append(files, "pos_guards.sql")
-	files = append(files, "0004_station_identity.sql", "0005_traffic_lab.sql", "0006_pos_consumer_identity.sql")
+	files = append(files, "0004_station_identity.sql", "0005_traffic_lab.sql", "0006_pos_consumer_identity.sql", "0007_pos_consumer_pairing.sql")
 	for _, f := range files {
 		b, err := migrations.ReadFile("migrations/" + f)
 		if err != nil {
