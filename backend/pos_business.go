@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type posCommand struct {
@@ -22,6 +23,7 @@ type posCommand struct {
 	OpeningCash    int64  `json:"openingCash"`
 	ClosingCash    int64  `json:"closingCash"`
 	Tender         int64  `json:"tender"`
+	PairingToken   string `json:"pairingToken,omitempty"`
 	IdempotencyKey string `json:"idempotencyKey"`
 }
 
@@ -185,6 +187,26 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 			fail(w, 400, "Cash tender is less than the total")
 			return
 		}
+		var linkedCustomerID sql.NullString
+		if in.PairingToken != "" {
+			if len(in.PairingToken) < 8 || len(in.PairingToken) > 128 {
+				terminalPOSBusinessRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 400, "Invalid pairing token format")
+				return
+			}
+			pHash := digest(in.PairingToken)
+			now := time.Now().UnixMilli()
+			var accountID string
+			e = tx.QueryRow(`SELECT p.account_id FROM pos_consumer_pairing_tokens p JOIN pos_consumer_accounts a ON a.id=p.account_id AND a.organization_id=p.organization_id WHERE p.token_hash=? AND p.organization_id=? AND p.consumed_sale_id IS NULL AND p.expires_at>? AND a.verified_at IS NOT NULL AND a.disabled=0`, pHash, id.OrganizationID, now).Scan(&accountID)
+			if errors.Is(e, sql.ErrNoRows) {
+				terminalPOSBusinessRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Invalid, expired, or consumed consumer pairing token")
+				return
+			}
+			if e != nil {
+				fail(w, 503, "Cannot validate pairing token")
+				return
+			}
+			linkedCustomerID = sql.NullString{String: accountID, Valid: true}
+		}
 		update, err := tx.Exec("UPDATE pos_catalog_items SET stock_quantity=stock_quantity-? WHERE id=? AND organization_id=? AND stock_quantity>=?", in.Quantity, in.ItemID, id.OrganizationID, in.Quantity)
 		if err != nil {
 			fail(w, 503, "Stock update failed")
@@ -198,10 +220,27 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		entityID = "sale_" + token()
 		receipt := "POS-" + strings.ToUpper(token()[:12])
 		change := in.Tender - total
-		_, e = tx.Exec("INSERT INTO pos_sales(id,organization_id,receipt_number,store_id,register_id,shift_id,cashier_id,subtotal,total_amount,tender_amount,change_amount,payment_method,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,'cash','completed',?)", entityID, id.OrganizationID, receipt, store, register, in.ShiftID, id.UserID, total, total, in.Tender, change, in.IdempotencyKey)
+		var custVal any
+		if linkedCustomerID.Valid {
+			custVal = linkedCustomerID.String
+		}
+		_, e = tx.Exec("INSERT INTO pos_sales(id,organization_id,receipt_number,store_id,register_id,shift_id,cashier_id,customer_id,subtotal,total_amount,tender_amount,change_amount,payment_method,status,idempotency_key) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,'cash','completed',?)", entityID, id.OrganizationID, receipt, store, register, in.ShiftID, id.UserID, custVal, total, total, in.Tender, change, in.IdempotencyKey)
 		if e != nil {
 			fail(w, 503, "Could not save sale")
 			return
+		}
+		if linkedCustomerID.Valid {
+			pHash := digest(in.PairingToken)
+			consumeRes, err := tx.Exec("UPDATE pos_consumer_pairing_tokens SET consumed_sale_id=? WHERE token_hash=? AND organization_id=? AND consumed_sale_id IS NULL", entityID, pHash, id.OrganizationID)
+			if err != nil {
+				fail(w, 503, "Could not consume pairing token")
+				return
+			}
+			affected, err := consumeRes.RowsAffected()
+			if err != nil || affected != 1 {
+				terminalPOSBusinessRejection(w, tx, id.OrganizationID, in.IdempotencyKey, endpoint, fingerprint, 409, "Pairing token was consumed by another request")
+				return
+			}
 		}
 		_, e = tx.Exec("INSERT INTO pos_sale_lines(id,organization_id,sale_id,item_id,barcode,name,unit_price,quantity,line_total) VALUES(?,?,?,?,?,?,?,?,?)", "sale_line_"+token(), id.OrganizationID, entityID, in.ItemID, barcode, name, price, in.Quantity, total)
 		if e != nil {
@@ -209,6 +248,9 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 			return
 		}
 		result = map[string]any{"saleId": entityID, "receiptNumber": receipt, "totalAmount": total, "changeAmount": change}
+		if linkedCustomerID.Valid {
+			result["customerId"] = linkedCustomerID.String
+		}
 	case "refund":
 		var saleID, itemID, shiftID, shiftStatus, saleStatus, paymentMethod string
 		var sold, refunded int
