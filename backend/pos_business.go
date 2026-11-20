@@ -247,6 +247,38 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 			fail(w, 503, "Could not save sale line")
 			return
 		}
+		var custPtr *string
+		if linkedCustomerID.Valid {
+			s := linkedCustomerID.String
+			custPtr = &s
+		}
+		evtID := "evt_" + token()
+		outboxPayload := OutboxSaleCompletedPayload{
+			EventID:        evtID,
+			SchemaVersion:  1,
+			OrganizationID: id.OrganizationID,
+			SourceID:       entityID,
+			ReceiptNumber:  receipt,
+			TotalAmount:    total,
+			Subtotal:       total,
+			PaymentMethod:  "cash",
+			CustomerID:     custPtr,
+			Lines: []OutboxSaleLine{
+				{
+					ItemID:    in.ItemID,
+					Barcode:   barcode,
+					Name:      name,
+					UnitPrice: price,
+					Quantity:  int64(in.Quantity),
+					LineTotal: total,
+				},
+			},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := emitOutboxEvent(tx, id.OrganizationID, "pos.sale.completed", evtID, outboxPayload); err != nil {
+			fail(w, 503, "Could not save sale outbox event")
+			return
+		}
 		result = map[string]any{"saleId": entityID, "receiptNumber": receipt, "totalAmount": total, "changeAmount": change}
 		if linkedCustomerID.Valid {
 			result["customerId"] = linkedCustomerID.String
@@ -310,6 +342,31 @@ func (a *App) posBusiness(w http.ResponseWriter, r *http.Request, id *Identity, 
 		}
 		if _, e = tx.Exec("INSERT INTO pos_refund_lines(id,organization_id,refund_id,sale_line_id,quantity,amount) VALUES(?,?,?,?,?,?)", "refund_line_"+token(), id.OrganizationID, entityID, in.SaleLineID, in.Quantity, amount); e != nil {
 			fail(w, 503, "Could not save refund line")
+			return
+		}
+		evtID := "evt_" + token()
+		refundPayload := OutboxSaleRefundedPayload{
+			EventID:        evtID,
+			SchemaVersion:  1,
+			OrganizationID: id.OrganizationID,
+			SourceID:       entityID,
+			OriginalSaleID: saleID,
+			RefundNumber:   number,
+			RefundAmount:   amount,
+			TotalAmount:    amount,
+			Reason:         strings.TrimSpace(in.Reason),
+			Lines: []OutboxRefundLine{
+				{
+					SaleLineID: in.SaleLineID,
+					ItemID:     itemID,
+					Quantity:   int64(in.Quantity),
+					Amount:     amount,
+				},
+			},
+			OccurredAt: time.Now().UTC().Format(time.RFC3339),
+		}
+		if err := emitOutboxEvent(tx, id.OrganizationID, "pos.sale.refunded", evtID, refundPayload); err != nil {
+			fail(w, 503, "Could not save refund outbox event")
 			return
 		}
 		result = map[string]any{"refundId": entityID, "refundNumber": number, "refundAmount": amount, "quantity": in.Quantity}

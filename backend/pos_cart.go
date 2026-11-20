@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type posCartLine struct {
@@ -322,6 +323,36 @@ func (a *App) posCart(w http.ResponseWriter, r *http.Request, id *Identity, g *G
 						return
 					}
 				}
+			}
+			if e == nil {
+				outboxLines := make([]OutboxSaleLine, 0, len(resolvedLines))
+				for _, line := range resolvedLines {
+					outboxLines = append(outboxLines, OutboxSaleLine{
+						ItemID:         line.ItemID,
+						Barcode:        line.barcode,
+						Name:           line.name,
+						UnitPrice:      line.price,
+						Quantity:       line.Quantity,
+						DiscountAmount: line.DiscountAmount,
+						LineTotal:      line.gross - line.DiscountAmount,
+					})
+				}
+				evtID := "evt_" + token()
+				outboxPayload := OutboxSaleCompletedPayload{
+					EventID:        evtID,
+					SchemaVersion:  1,
+					OrganizationID: id.OrganizationID,
+					SourceID:       entity,
+					ReceiptNumber:  receipt,
+					TotalAmount:    total,
+					Subtotal:       subtotal,
+					DiscountAmount: discountTotal,
+					PaymentMethod:  "cash",
+					CustomerID:     nil,
+					Lines:          outboxLines,
+					OccurredAt:     time.Now().UTC().Format(time.RFC3339),
+				}
+				e = emitOutboxEvent(tx, id.OrganizationID, "pos.sale.completed", evtID, outboxPayload)
 			}
 			result = map[string]any{"saleId": entity, "receiptNumber": receipt, "subtotal": subtotal, "discountAmount": discountTotal, "totalAmount": total, "changeAmount": in.Tender - total}
 		}
